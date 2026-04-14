@@ -33,7 +33,10 @@ export function ImpactsTable({ impacts }: ImpactsTableProps) {
       <div className="section-copy">
         <p className="section-kicker">Impacts</p>
         <h2 id="impacts-title">Final ranked impacts</h2>
-        <p>The table reflects persisted P5 results from the backend. Scores are already ordered descending.</p>
+        <p>
+          The table reflects persisted P6 impact results from the backend. Scores are
+          already ordered descending.
+        </p>
       </div>
 
       <div className="table-scroll">

@@ -1,6 +1,7 @@
 export type DiffMode = "working_tree" | "commit_range" | "refs_compare";
 export type AnalysisStatus = "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
 export type Confidence = "high" | "medium" | "low";
+export type Priority = "high" | "medium" | "low";
 export type SymbolKind =
   | "module"
   | "class"
@@ -72,6 +73,7 @@ export interface AnalysisSummary {
   impacted_tests: number;
   propagation_paths: number;
   recommended_tests: number;
+  high_confidence_test_recommendations: number;
   skipped_files: number;
   parse_failures: number;
   scanned_files: number;
@@ -118,12 +120,35 @@ export interface WarningMessage {
   message: string;
 }
 
+export interface TestRecommendationReasonsJson {
+  whether_coverage_used: boolean;
+  matched_impacted_symbol: string;
+  relation_type: string;
+  hop_count: number;
+  merged_paths_count: number;
+  is_direct_test_hit: boolean;
+  evidence: EvidenceItem[];
+}
+
+export interface TestSuggestionItem {
+  test_symbol_id: string;
+  test_name: string;
+  file_path: string;
+  score: number;
+  confidence: Confidence;
+  priority: Priority;
+  reason: string;
+  reasons_json: TestRecommendationReasonsJson;
+  coverage_backed: boolean;
+}
+
 export interface AnalysisResult {
   analysis_id: string;
   repository_id: string;
   status: AnalysisStatus;
   summary: AnalysisSummary;
   impacts: ImpactItem[];
+  test_suggestions: TestSuggestionItem[];
   warnings: WarningMessage[];
 }
 

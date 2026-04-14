@@ -20,6 +20,7 @@ interface AnalysisFormState {
   base_ref: string;
   head_ref: string;
   include_untracked: boolean;
+  use_coverage: boolean;
   max_depth: number;
 }
 
@@ -39,6 +40,7 @@ export function AnalysisForm({
     base_ref: "",
     head_ref: "",
     include_untracked: false,
+    use_coverage: false,
     max_depth: 4,
   });
 
@@ -70,7 +72,7 @@ export function AnalysisForm({
       options: {
         max_depth: Number(form.max_depth),
         include_tests: true,
-        use_coverage: false,
+        use_coverage: form.use_coverage,
       },
     };
 
@@ -94,8 +96,11 @@ export function AnalysisForm({
     <form className="workbench-form" onSubmit={handleSubmit}>
       <div className="section-copy">
         <p className="section-kicker">Analysis</p>
-        <h2>Run a real P5 analysis</h2>
-        <p>The current backend supports diff mapping, structural propagation, final impact scoring, and Markdown reports.</p>
+        <h2>Run a real P6 analysis</h2>
+        <p>
+          The current backend supports diff mapping, structural propagation, final
+          impact scoring, and explainable test recommendations.
+        </p>
       </div>
 
       <label className="field">
@@ -194,6 +199,15 @@ export function AnalysisForm({
           onChange={(event) => updateField("include_untracked", event.target.checked)}
         />
         <span>Include untracked files for working_tree</span>
+      </label>
+
+      <label className="checkbox-field">
+        <input
+          type="checkbox"
+          checked={form.use_coverage}
+          onChange={(event) => updateField("use_coverage", event.target.checked)}
+        />
+        <span>Use coverage contexts when a supported coverage.json artifact exists</span>
       </label>
 
       {error ? <p className="message message-error">{error}</p> : null}

@@ -23,6 +23,7 @@ import { ReportPanel } from "../components/ReportPanel";
 import { RepositoryForm } from "../components/RepositoryForm";
 import { StatusBadge } from "../components/StatusBadge";
 import { SummaryPanel } from "../components/SummaryPanel";
+import { TestRecommendationsTable } from "../components/TestRecommendationsTable";
 
 type HealthState = "checking" | "ok" | "unavailable";
 
@@ -129,6 +130,11 @@ export default function WorkbenchPage() {
     () => repositories.find((repository) => repository.repository_id === selectedRepositoryId) ?? null,
     [repositories, selectedRepositoryId],
   );
+  const coverageWarning = useMemo(
+    () =>
+      currentAnalysis?.warnings.find((warning) => warning.code === "NO_COVERAGE_DATA") ?? null,
+    [currentAnalysis],
+  );
 
   async function loadAnalysisBundle(
     analysisId: string,
@@ -214,10 +220,11 @@ export default function WorkbenchPage() {
     <main className="workbench-shell">
       <section className="headline-band">
         <div className="headline-copy">
-          <p className="section-kicker">B-Impact P5.5</p>
+          <p className="section-kicker">B-Impact P6.5</p>
           <h1>Python change-impact workbench</h1>
           <p>
-            Register a repository, run a real analysis, inspect summary metrics, and review scored impacts from the current P5 backend.
+            Register a repository, run a real analysis, inspect summary metrics, review scored
+            impacts, and see persisted test recommendations from the current P6 backend.
           </p>
         </div>
         <div className="headline-status">
@@ -385,6 +392,10 @@ export default function WorkbenchPage() {
 
               <SummaryPanel summary={currentAnalysis.summary} />
               <ImpactsTable impacts={currentAnalysis.impacts} />
+              <TestRecommendationsTable
+                recommendations={currentAnalysis.test_suggestions}
+                coverageWarning={coverageWarning}
+              />
               <ReportPanel report={reportContent} />
             </>
           ) : !resultLoading && !resultError ? (
@@ -392,7 +403,10 @@ export default function WorkbenchPage() {
               <div className="section-copy">
                 <p className="section-kicker">Results</p>
                 <h2>No analysis loaded yet</h2>
-                <p>Run an analysis or load one by ID to inspect real P5 summary metrics, scored impacts, and the generated report.</p>
+                <p>
+                  Run an analysis or load one by ID to inspect real P6 summary metrics, scored
+                  impacts, recommended tests, and the generated report.
+                </p>
               </div>
             </section>
           ) : null}

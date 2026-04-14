@@ -322,6 +322,38 @@ th {
   margin-top: 16px;
 }
 
+.info-banner {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid #d7e1d8;
+  border-radius: 8px;
+  background: #f7faf5;
+}
+
+.info-banner strong {
+  color: #214433;
+}
+
+.info-banner span {
+  color: #426053;
+  line-height: 1.5;
+}
+
+.info-banner-warning {
+  border-color: #d6c17a;
+  background: #fff8dc;
+}
+
+.info-banner-warning strong {
+  color: #6d5200;
+}
+
+.info-banner-warning span {
+  color: #705612;
+}
+
 .message {
   margin: 0;
 }

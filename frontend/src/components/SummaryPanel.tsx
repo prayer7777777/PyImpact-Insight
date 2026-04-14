@@ -9,6 +9,11 @@ const SUMMARY_ITEMS: Array<{ key: keyof AnalysisSummary; label: string }> = [
   { key: "changed_symbols", label: "Changed symbols" },
   { key: "impacted_symbols", label: "Impacted candidates" },
   { key: "impacted_tests", label: "Impacted tests" },
+  { key: "recommended_tests", label: "Recommended tests" },
+  {
+    key: "high_confidence_test_recommendations",
+    label: "High confidence test recommendations",
+  },
   { key: "high_confidence_impacts", label: "High confidence impacts" },
   { key: "top_impacts", label: "Final impacts" },
 ];
