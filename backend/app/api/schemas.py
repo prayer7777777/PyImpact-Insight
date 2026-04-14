@@ -149,7 +149,9 @@ class AnalysisAccepted(BaseModel):
 
 class AnalysisSummary(BaseModel):
     changed_files: int = Field(default=0, ge=0)
+    changed_python_files: int = Field(default=0, ge=0)
     changed_symbols: int = Field(default=0, ge=0)
+    unmapped_changes: int = Field(default=0, ge=0)
     impacted_symbols: int = Field(default=0, ge=0)
     recommended_tests: int = Field(default=0, ge=0)
     skipped_files: int = Field(default=0, ge=0)

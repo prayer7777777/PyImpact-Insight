@@ -6,11 +6,13 @@ from uuid import UUID
 from pydantic import TypeAdapter
 from sqlalchemy.orm import Session
 
+from app.analyzers.git_diff import ChangedFile, ChangedLineRange, GitDiffError, GitDiffReader
 from app.analyzers.python_ast_parser import ParsedPythonFile, PythonAstParser
 from app.analyzers.python_scanner import scan_python_files
 from app.api import schemas
 from app.core.errors import ApiError
 from app.db import models
+from app.repositories.change_repository import ChangeRepository
 from app.repositories.analysis_artifact_repository import AnalysisArtifactRepository
 from app.repositories.analysis_repository import AnalysisRepository
 from app.repositories.repository_repository import RepositoryRepository
@@ -18,7 +20,9 @@ from app.repositories.repository_repository import RepositoryRepository
 
 ZERO_SUMMARY = {
     "changed_files": 0,
+    "changed_python_files": 0,
     "changed_symbols": 0,
+    "unmapped_changes": 0,
     "impacted_symbols": 0,
     "recommended_tests": 0,
     "skipped_files": 0,
@@ -31,8 +35,8 @@ ZERO_SUMMARY = {
 }
 
 NO_IMPACT_ENGINE_WARNING = {
-    "code": "P2_NO_IMPACT_ENGINE",
-    "message": "P2 extracts Python files, symbols, and import/contains/inherits edges but does not run Git diff, change mapping, calls analysis, impact propagation, scoring, coverage, or test recommendation.",
+    "code": "P3_NO_IMPACT_ENGINE",
+    "message": "P3 extracts Python symbols, reads Git diff, and maps changed Python lines to symbols but does not run calls analysis, impact propagation, scoring, coverage, or test recommendation.",
 }
 
 
@@ -41,6 +45,7 @@ class AnalysisService:
         self.session = session
         self.analysis_repository = AnalysisRepository(session)
         self.artifact_repository = AnalysisArtifactRepository(session)
+        self.change_repository = ChangeRepository(session)
         self.repository_repository = RepositoryRepository(session)
 
     def create_analysis(self, payload: schemas.AnalysisCreate) -> schemas.AnalysisAccepted:
@@ -82,7 +87,7 @@ class AnalysisService:
                 status=schemas.AnalysisStatus.RUNNING.value,
                 started_at=running_at,
             )
-            summary, warnings = self._extract_repository_symbols(repository, analysis)
+            summary, warnings = self._run_repository_analysis(repository, analysis)
             self.analysis_repository.set_status(
                 analysis,
                 status=schemas.AnalysisStatus.COMPLETED.value,
@@ -90,6 +95,16 @@ class AnalysisService:
                 summary=summary,
                 warnings=warnings,
             )
+        except GitDiffError as exc:
+            self.session.rollback()
+            self.analysis_repository.set_status(
+                analysis,
+                status=schemas.AnalysisStatus.FAILED.value,
+                finished_at=datetime.now(UTC),
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+            raise ApiError(exc.code, exc.message, details=exc.details) from exc
         except Exception as exc:
             self.session.rollback()
             self.analysis_repository.set_status(
@@ -103,14 +118,17 @@ class AnalysisService:
 
         return accepted
 
-    def _extract_repository_symbols(
+    def _run_repository_analysis(
         self, repository: models.Repository, analysis: models.Analysis
     ) -> tuple[dict, list[dict]]:
         parser = PythonAstParser()
+        diff_reader = GitDiffReader()
         paths = scan_python_files(repository.repo_path)
         parsed_files = [parser.parse_file(repository.repo_path, path) for path in paths]
 
         now = datetime.now(UTC)
+        code_file_by_path: dict[str, models.CodeFile] = {}
+        symbols_by_file_path: dict[str, list[models.Symbol]] = {}
         symbol_by_qualname: dict[str, models.Symbol] = {}
         module_symbol_by_name: dict[str, models.Symbol] = {}
         class_symbols_by_name: dict[str, list[models.Symbol]] = {}
@@ -126,6 +144,7 @@ class AnalysisService:
                 error_message=parsed.error_message,
                 created_at=now,
             )
+            code_file_by_path[parsed.relative_path] = code_file
             if parsed.parse_status != schemas.ParseStatus.PARSED:
                 continue
 
@@ -140,6 +159,7 @@ class AnalysisService:
                     end_line=parsed_symbol.end_line,
                     created_at=now,
                 )
+                symbols_by_file_path.setdefault(parsed.relative_path, []).append(symbol)
                 symbol_by_qualname[parsed_symbol.qualname] = symbol
                 if parsed_symbol.kind == schemas.SymbolKind.MODULE:
                     module_symbol_by_name[parsed.module_name] = symbol
@@ -154,7 +174,23 @@ class AnalysisService:
             class_symbols_by_name=class_symbols_by_name,
             created_at=now,
         )
-        self.artifact_repository.commit()
+
+        diff_result = diff_reader.read(
+            repo_path=repository.repo_path,
+            diff_mode=schemas.DiffMode(analysis.diff_mode),
+            commit_from=analysis.commit_from,
+            commit_to=analysis.commit_to,
+            base_ref=analysis.base_ref,
+            head_ref=analysis.head_ref,
+            include_untracked=analysis.include_untracked,
+        )
+        change_summary = self._persist_change_mapping(
+            analysis_id=analysis.analysis_id,
+            changed_files=diff_result.files,
+            code_file_by_path=code_file_by_path,
+            symbols_by_file_path=symbols_by_file_path,
+            created_at=now,
+        )
 
         parse_failed_files = sum(
             1 for parsed in parsed_files if parsed.parse_status == schemas.ParseStatus.PARSE_FAILED
@@ -170,6 +206,7 @@ class AnalysisService:
                 "extracted_edges": created_edges,
             }
         )
+        summary.update(change_summary)
         warnings = [NO_IMPACT_ENGINE_WARNING.copy()]
         if parse_failed_files:
             failed_paths = [
@@ -184,6 +221,145 @@ class AnalysisService:
                 }
             )
         return summary, warnings
+
+    def _persist_change_mapping(
+        self,
+        *,
+        analysis_id: str,
+        changed_files: list[ChangedFile],
+        code_file_by_path: dict[str, models.CodeFile],
+        symbols_by_file_path: dict[str, list[models.Symbol]],
+        created_at: datetime,
+    ) -> dict[str, int]:
+        created_changed_symbols: set[str] = set()
+        unmapped_changes = 0
+        skipped_files = 0
+
+        for changed_file in changed_files:
+            if not changed_file.is_python or changed_file.is_binary:
+                skipped_files += 1
+            code_file = code_file_by_path.get(changed_file.path)
+            symbols = symbols_by_file_path.get(changed_file.path, [])
+            ranges: list[ChangedLineRange | None] = (
+                list(changed_file.line_ranges) if changed_file.line_ranges else [None]
+            )
+
+            for line_range in ranges:
+                mapped_symbols = self._symbols_for_changed_range(symbols, line_range)
+                mapped_symbol = self._primary_mapped_symbol(mapped_symbols)
+                should_record_unmapped = (
+                    changed_file.is_python
+                    and not changed_file.is_binary
+                    and line_range is not None
+                    and mapped_symbol is None
+                )
+                if should_record_unmapped:
+                    unmapped_changes += 1
+
+                self.change_repository.create_change_span(
+                    analysis_id=analysis_id,
+                    file_id=code_file.file_id if code_file is not None else None,
+                    mapped_symbol_id=mapped_symbol.symbol_id if mapped_symbol is not None else None,
+                    path=changed_file.path,
+                    old_path=changed_file.old_path,
+                    change_type=changed_file.change_type.value,
+                    start_line=line_range.start_line if line_range is not None else None,
+                    end_line=line_range.end_line if line_range is not None else None,
+                    is_python=changed_file.is_python,
+                    is_binary=changed_file.is_binary,
+                    is_unmapped=should_record_unmapped,
+                    created_at=created_at,
+                )
+
+                for symbol in mapped_symbols:
+                    if symbol.symbol_id in created_changed_symbols:
+                        continue
+                    created_changed_symbols.add(symbol.symbol_id)
+                    self.change_repository.create_changed_symbol(
+                        analysis_id=analysis_id,
+                        symbol_id=symbol.symbol_id,
+                        file_id=symbol.file_id,
+                        symbol_key=f"{changed_file.path}::{symbol.qualname}",
+                        symbol_name=symbol.name,
+                        symbol_kind=symbol.kind,
+                        file_path=changed_file.path,
+                        change_type=changed_file.change_type.value,
+                        start_line=symbol.start_line,
+                        end_line=symbol.end_line,
+                        is_module_level=symbol.kind == schemas.SymbolKind.MODULE.value,
+                        created_at=created_at,
+                    )
+
+        return {
+            "changed_files": len(changed_files),
+            "changed_python_files": sum(1 for changed_file in changed_files if changed_file.is_python),
+            "changed_symbols": len(created_changed_symbols),
+            "unmapped_changes": unmapped_changes,
+            "skipped_files": skipped_files,
+        }
+
+    def _symbols_for_changed_range(
+        self, symbols: list[models.Symbol], line_range: ChangedLineRange | None
+    ) -> list[models.Symbol]:
+        if line_range is None:
+            return []
+
+        module_symbol = next(
+            (symbol for symbol in symbols if symbol.kind == schemas.SymbolKind.MODULE.value),
+            None,
+        )
+        mapped_by_id: dict[str, models.Symbol] = {}
+        if module_symbol is not None and self._line_range_overlaps_symbol(line_range, module_symbol):
+            mapped_by_id[module_symbol.symbol_id] = module_symbol
+
+        for line_number in range(line_range.start_line, line_range.end_line + 1):
+            candidates = [
+                symbol
+                for symbol in symbols
+                if symbol.kind != schemas.SymbolKind.MODULE.value
+                and symbol.start_line <= line_number <= symbol.end_line
+            ]
+            if not candidates:
+                continue
+            innermost = min(
+                candidates,
+                key=lambda symbol: (
+                    symbol.end_line - symbol.start_line,
+                    -(symbol.start_line),
+                ),
+            )
+            mapped_by_id[innermost.symbol_id] = innermost
+
+        return sorted(
+            mapped_by_id.values(),
+            key=lambda symbol: (
+                symbol.kind != schemas.SymbolKind.MODULE.value,
+                symbol.start_line,
+                symbol.end_line,
+                symbol.qualname,
+            ),
+        )
+
+    def _primary_mapped_symbol(self, symbols: list[models.Symbol]) -> models.Symbol | None:
+        non_module_symbols = [
+            symbol for symbol in symbols if symbol.kind != schemas.SymbolKind.MODULE.value
+        ]
+        if non_module_symbols:
+            return min(
+                non_module_symbols,
+                key=lambda symbol: (
+                    symbol.end_line - symbol.start_line,
+                    -(symbol.start_line),
+                ),
+            )
+        if symbols:
+            return symbols[0]
+        return None
+
+    def _line_range_overlaps_symbol(
+        self, line_range: ChangedLineRange, symbol: models.Symbol
+    ) -> bool:
+        return line_range.start_line <= symbol.end_line and line_range.end_line >= symbol.start_line
 
     def _persist_edges(
         self,
@@ -332,7 +508,9 @@ class AnalysisService:
             "## Summary",
             "",
             f"- Changed files: {result.summary.changed_files}",
+            f"- Changed Python files: {result.summary.changed_python_files}",
             f"- Changed symbols: {result.summary.changed_symbols}",
+            f"- Unmapped changes: {result.summary.unmapped_changes}",
             f"- Impacted symbols: {result.summary.impacted_symbols}",
             f"- Recommended tests: {result.summary.recommended_tests}",
             f"- Skipped files: {result.summary.skipped_files}",
@@ -343,13 +521,28 @@ class AnalysisService:
             f"- Extracted symbols: {result.summary.extracted_symbols}",
             f"- Extracted edges: {result.summary.extracted_edges}",
             "",
-            "## Limitations",
-            "",
-            "- P2 scans Python files and extracts module/class/function/method/test symbols.",
-            "- P2 extracts contains, imports, and simple inheritance edges.",
-            "- P2 does not run Git diff, change mapping, calls analysis, impact propagation, scoring, coverage, or test recommendation.",
+            "## Changed Symbols",
             "",
         ]
+        if result.changed_symbols:
+            lines.extend(
+                f"- `{item.symbol_key}` ({item.symbol_kind.value}, {item.change_type.value}, "
+                f"lines {item.start_line}-{item.end_line})"
+                for item in result.changed_symbols
+            )
+            lines.append("")
+        else:
+            lines.extend(["- No changed Python symbols were mapped.", ""])
+        lines.extend(
+            [
+            "## Limitations",
+            "",
+            "- P3 scans the current working tree for Python symbols before mapping diff line ranges.",
+            "- P3 maps changed Python lines to module-level and innermost symbols only.",
+            "- P3 does not run calls analysis, impact propagation, scoring, coverage, or test recommendation.",
+            "",
+            ]
+        )
         if result.warnings:
             lines.extend(["## Warnings", ""])
             lines.extend(f"- `{warning.code}`: {warning.message}" for warning in result.warnings)
@@ -368,6 +561,19 @@ class AnalysisService:
         return analysis
 
     def _to_result_schema(self, analysis: models.Analysis) -> schemas.AnalysisResult:
+        changed_symbols = [
+            schemas.ChangedSymbolItem(
+                symbol_id=item.symbol_id,
+                symbol_key=item.symbol_key,
+                symbol_name=item.symbol_name,
+                symbol_kind=item.symbol_kind,
+                file_path=item.file_path,
+                start_line=item.start_line,
+                end_line=item.end_line,
+                change_type=item.change_type,
+            )
+            for item in self.change_repository.list_changed_symbols(analysis.analysis_id)
+        ]
         impacts = [
             schemas.ImpactItem(
                 symbol_id=impact.symbol_id,
@@ -400,7 +606,7 @@ class AnalysisService:
             repository_id=analysis.repository_id,
             status=schemas.AnalysisStatus(analysis.status),
             summary=schemas.AnalysisSummary(**(analysis.summary or ZERO_SUMMARY)),
-            changed_symbols=[],
+            changed_symbols=changed_symbols,
             impacts=impacts,
             test_suggestions=test_suggestions,
             warnings=warning_adapter.validate_python(analysis.warnings or []),

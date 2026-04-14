@@ -57,6 +57,8 @@ class Analysis(Base):
     code_files: Mapped[list[CodeFile]] = relationship(back_populates="analysis")
     symbols: Mapped[list[Symbol]] = relationship(back_populates="analysis")
     edges: Mapped[list[Edge]] = relationship(back_populates="analysis")
+    change_spans: Mapped[list[ChangeSpan]] = relationship(back_populates="analysis")
+    changed_symbols: Mapped[list[ChangedSymbol]] = relationship(back_populates="analysis")
     impacts: Mapped[list[Impact]] = relationship(back_populates="analysis")
     test_recommendations: Mapped[list[TestRecommendation]] = relationship(back_populates="analysis")
 
@@ -81,6 +83,8 @@ class CodeFile(Base):
     repository: Mapped[Repository] = relationship(back_populates="code_files")
     analysis: Mapped[Analysis] = relationship(back_populates="code_files")
     symbols: Mapped[list[Symbol]] = relationship(back_populates="code_file")
+    change_spans: Mapped[list[ChangeSpan]] = relationship(back_populates="code_file")
+    changed_symbols: Mapped[list[ChangedSymbol]] = relationship(back_populates="code_file")
 
 
 class Symbol(Base):
@@ -102,6 +106,8 @@ class Symbol(Base):
 
     analysis: Mapped[Analysis] = relationship(back_populates="symbols")
     code_file: Mapped[CodeFile] = relationship(back_populates="symbols")
+    change_spans: Mapped[list[ChangeSpan]] = relationship(back_populates="mapped_symbol")
+    changed_symbols: Mapped[list[ChangedSymbol]] = relationship(back_populates="symbol")
 
 
 class Edge(Base):
@@ -125,6 +131,62 @@ class Edge(Base):
     analysis: Mapped[Analysis] = relationship(back_populates="edges")
     src_symbol: Mapped[Symbol] = relationship(foreign_keys=[src_symbol_id])
     dst_symbol: Mapped[Symbol] = relationship(foreign_keys=[dst_symbol_id])
+
+
+class ChangeSpan(Base):
+    __tablename__ = "change_spans"
+
+    change_span_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    analysis_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("analyses.analysis_id"), nullable=False, index=True
+    )
+    file_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("code_files.file_id"), nullable=True, index=True
+    )
+    mapped_symbol_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("symbols.symbol_id"), nullable=True, index=True
+    )
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    old_path: Mapped[str | None] = mapped_column(Text)
+    change_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    start_line: Mapped[int | None] = mapped_column(Integer)
+    end_line: Mapped[int | None] = mapped_column(Integer)
+    is_python: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_binary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_unmapped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    analysis: Mapped[Analysis] = relationship(back_populates="change_spans")
+    code_file: Mapped[CodeFile | None] = relationship(back_populates="change_spans")
+    mapped_symbol: Mapped[Symbol | None] = relationship(back_populates="change_spans")
+
+
+class ChangedSymbol(Base):
+    __tablename__ = "changed_symbols"
+
+    changed_symbol_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    analysis_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("analyses.analysis_id"), nullable=False, index=True
+    )
+    symbol_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("symbols.symbol_id"), nullable=False, index=True
+    )
+    file_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("code_files.file_id"), nullable=False, index=True
+    )
+    symbol_key: Mapped[str] = mapped_column(Text, nullable=False)
+    symbol_name: Mapped[str] = mapped_column(Text, nullable=False)
+    symbol_kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    change_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    start_line: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_line: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_module_level: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    analysis: Mapped[Analysis] = relationship(back_populates="changed_symbols")
+    symbol: Mapped[Symbol] = relationship(back_populates="changed_symbols")
+    code_file: Mapped[CodeFile] = relationship(back_populates="changed_symbols")
 
 
 class Impact(Base):
