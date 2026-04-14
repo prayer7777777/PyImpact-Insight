@@ -51,6 +51,38 @@ class AnalysisRepository:
     def get_by_id(self, analysis_id: str) -> models.Analysis | None:
         return self.session.get(models.Analysis, analysis_id)
 
+    def create_test_recommendation(
+        self,
+        *,
+        analysis_id: str,
+        test_symbol_id: str,
+        test_name: str,
+        file_path: str,
+        score: float,
+        confidence: str,
+        priority: str,
+        reason: str,
+        reasons_json: dict[str, Any],
+        coverage_backed: bool,
+        rank: int,
+    ) -> models.TestRecommendation:
+        record = models.TestRecommendation(
+            analysis_id=analysis_id,
+            test_symbol_id=test_symbol_id,
+            test_name=test_name,
+            file_path=file_path,
+            score=score,
+            confidence=confidence,
+            priority=priority,
+            reason=reason,
+            reasons_json=reasons_json,
+            coverage_backed=coverage_backed,
+            rank=rank,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return record
+
     def list_impacts(self, analysis_id: str) -> list[models.Impact]:
         statement = select(models.Impact).where(models.Impact.analysis_id == analysis_id)
         return list(self.session.execute(statement).scalars().all())
@@ -58,6 +90,11 @@ class AnalysisRepository:
     def list_test_recommendations(self, analysis_id: str) -> list[models.TestRecommendation]:
         statement = select(models.TestRecommendation).where(
             models.TestRecommendation.analysis_id == analysis_id
+        ).order_by(
+            models.TestRecommendation.score.desc(),
+            models.TestRecommendation.rank,
+            models.TestRecommendation.file_path,
+            models.TestRecommendation.test_name,
         )
         return list(self.session.execute(statement).scalars().all())
 

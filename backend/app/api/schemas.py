@@ -158,6 +158,7 @@ class AnalysisSummary(BaseModel):
     impacted_tests: int = Field(default=0, ge=0)
     propagation_paths: int = Field(default=0, ge=0)
     recommended_tests: int = Field(default=0, ge=0)
+    high_confidence_test_recommendations: int = Field(default=0, ge=0)
     skipped_files: int = Field(default=0, ge=0)
     parse_failures: int = Field(default=0, ge=0)
     scanned_files: int = Field(default=0, ge=0)
@@ -225,12 +226,25 @@ class ImpactItem(BaseModel):
     reasons_json: ReasonsJson
 
 
+class TestRecommendationReasonsJson(BaseModel):
+    whether_coverage_used: bool = False
+    matched_impacted_symbol: str
+    relation_type: str
+    hop_count: int = Field(ge=0)
+    merged_paths_count: int = Field(default=1, ge=1)
+    is_direct_test_hit: bool = False
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+
+
 class TestSuggestionItem(BaseModel):
     test_symbol_id: UUID
     test_name: str
     file_path: str
+    score: float = Field(ge=0.0, le=1.0)
+    confidence: Confidence
     priority: Priority
     reason: str
+    reasons_json: TestRecommendationReasonsJson
     coverage_backed: bool
 
 

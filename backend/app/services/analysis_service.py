@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID
 
 from pydantic import TypeAdapter
 from sqlalchemy.orm import Session
 
+from app.analyzers.coverage_loader import load_coverage_contexts
 from app.analyzers.git_diff import ChangedFile, ChangedLineRange, GitDiffError, GitDiffReader
 from app.analyzers.impact_propagation import (
     ChangedSeed as PropagationChangedSeed,
@@ -21,6 +23,13 @@ from app.analyzers.impact_scoring import (
 )
 from app.analyzers.python_ast_parser import ParsedPythonFile, PythonAstParser
 from app.analyzers.python_scanner import scan_python_files
+from app.analyzers.recommendation_engine import (
+    ImpactNode as RecommendationImpactNode,
+    TestEdgeNode,
+    TestSymbolNode,
+    recommend_tests,
+    test_context_aliases,
+)
 from app.api import schemas
 from app.core.errors import ApiError
 from app.db import models
@@ -42,6 +51,7 @@ ZERO_SUMMARY = {
     "impacted_tests": 0,
     "propagation_paths": 0,
     "recommended_tests": 0,
+    "high_confidence_test_recommendations": 0,
     "skipped_files": 0,
     "parse_failures": 0,
     "scanned_files": 0,
@@ -52,8 +62,8 @@ ZERO_SUMMARY = {
 }
 
 LIMITED_IMPACT_ENGINE_WARNING = {
-    "code": "P5_LIMITED_IMPACT_ENGINE",
-    "message": "P5 scores changed and structurally propagated symbols through imports, inheritance, and containment edges with deterministic hop decay, but it does not use calls, coverage, test recommendation, or historical snapshot graphs.",
+    "code": "P6_LIMITED_IMPACT_ENGINE",
+    "message": "P6 scores changed and structurally propagated symbols, builds baseline test relations, and produces explainable test recommendations from static graph data plus optional coverage contexts, but it does not use calls or historical snapshot graphs.",
 }
 
 
@@ -192,6 +202,19 @@ class AnalysisService:
             class_symbols_by_name=class_symbols_by_name,
             created_at=now,
         )
+        include_tests = bool((analysis.options or {}).get("include_tests", True))
+        use_coverage = bool((analysis.options or {}).get("use_coverage", False))
+        test_edge_count, test_warnings = self._persist_test_edges(
+            repository=repository,
+            analysis_id=analysis.analysis_id,
+            parsed_files=parsed_files,
+            symbol_by_qualname=symbol_by_qualname,
+            module_symbol_by_name=module_symbol_by_name,
+            symbols_by_file_path=symbols_by_file_path,
+            include_tests=include_tests,
+            use_coverage=use_coverage,
+            created_at=now,
+        )
 
         diff_result = diff_reader.read(
             repo_path=repository.repo_path,
@@ -218,6 +241,10 @@ class AnalysisService:
             analysis_id=analysis.analysis_id,
             max_depth=int((analysis.options or {}).get("max_depth", 4)),
         )
+        recommendation_summary = self._persist_test_recommendations(
+            analysis_id=analysis.analysis_id,
+            include_tests=include_tests,
+        )
 
         parse_failed_files = sum(
             1 for parsed in parsed_files if parsed.parse_status == schemas.ParseStatus.PARSE_FAILED
@@ -230,13 +257,15 @@ class AnalysisService:
                 "parsed_files": len(parsed_files) - parse_failed_files,
                 "parse_failed_files": parse_failed_files,
                 "extracted_symbols": len(symbol_by_qualname),
-                "extracted_edges": created_edges,
+                "extracted_edges": created_edges + test_edge_count,
             }
         )
         summary.update(change_summary)
         summary.update(impact_candidate_summary)
         summary.update(final_impact_summary)
+        summary.update(recommendation_summary)
         warnings = [LIMITED_IMPACT_ENGINE_WARNING.copy()]
+        warnings.extend(test_warnings)
         if parse_failed_files:
             failed_paths = [
                 parsed.relative_path
@@ -402,6 +431,294 @@ class AnalysisService:
             "impacted_symbols": len(candidates),
             "impacted_tests": sum(1 for candidate in candidates if candidate.is_test),
             "propagation_paths": len(candidates),
+        }
+
+    def _persist_test_edges(
+        self,
+        *,
+        repository: models.Repository,
+        analysis_id: str,
+        parsed_files: list[ParsedPythonFile],
+        symbol_by_qualname: dict[str, models.Symbol],
+        module_symbol_by_name: dict[str, models.Symbol],
+        symbols_by_file_path: dict[str, list[models.Symbol]],
+        include_tests: bool,
+        use_coverage: bool,
+        created_at: datetime,
+    ) -> tuple[int, list[dict[str, str]]]:
+        if not include_tests:
+            return 0, []
+
+        module_file_by_name = {
+            parsed.module_name: parsed.relative_path
+            for parsed in parsed_files
+            if parsed.parse_status == schemas.ParseStatus.PARSED
+        }
+        edge_candidates: dict[tuple[str, str], dict[str, object]] = {}
+
+        for parsed in parsed_files:
+            if parsed.parse_status != schemas.ParseStatus.PARSED:
+                continue
+            test_symbols = [
+                parsed_symbol
+                for parsed_symbol in parsed.symbols
+                if parsed_symbol.kind.value
+                in {
+                    schemas.SymbolKind.TEST_FUNCTION.value,
+                    schemas.SymbolKind.TEST_METHOD.value,
+                }
+            ]
+            if not test_symbols:
+                continue
+
+            for import_ref in parsed.imports:
+                target = self._resolve_import_target(import_ref.candidates, module_symbol_by_name)
+                if target is None:
+                    continue
+                target_path = module_file_by_name.get(target.qualname)
+                if target_path is None or self._is_test_file_path(target_path):
+                    continue
+
+                for test_symbol in test_symbols:
+                    source = symbol_by_qualname.get(test_symbol.qualname)
+                    if source is None:
+                        continue
+                    self._store_test_edge_candidate(
+                        edge_candidates,
+                        source_symbol_id=source.symbol_id,
+                        target_symbol_id=target.symbol_id,
+                        weight=0.90,
+                        evidence={
+                            "edge_type": schemas.EdgeType.TESTS.value,
+                            "file_path": parsed.relative_path,
+                            "line": import_ref.line,
+                            "detail": (
+                                f"{test_symbol.qualname} imports production module {target.qualname}"
+                            ),
+                            "coverage_backed": False,
+                        },
+                    )
+
+        coverage_warnings: list[dict[str, str]] = []
+        coverage_edge_count = 0
+        if use_coverage:
+            coverage_result = load_coverage_contexts(repository.repo_path)
+            coverage_edge_count = self._store_coverage_test_edges(
+                analysis_id=analysis_id,
+                symbols_by_file_path=symbols_by_file_path,
+                edge_candidates=edge_candidates,
+                coverage_contexts_by_file=coverage_result.contexts_by_file,
+            )
+            if coverage_edge_count == 0:
+                if coverage_result.status == "missing":
+                    message = (
+                        "Coverage data was requested, but no supported coverage.json artifact was found; "
+                        "test recommendations use static fallback rules only."
+                    )
+                else:
+                    message = (
+                        "Coverage data was requested, but no usable per-test contexts were found; "
+                        "test recommendations use static fallback rules only."
+                    )
+                coverage_warnings.append(
+                    {
+                        "code": "NO_COVERAGE_DATA",
+                        "message": message,
+                    }
+                )
+
+        created_edges = 0
+        for (source_symbol_id, target_symbol_id), candidate in sorted(edge_candidates.items()):
+            self.artifact_repository.create_edge(
+                analysis_id=analysis_id,
+                src_symbol_id=source_symbol_id,
+                dst_symbol_id=target_symbol_id,
+                edge_type=schemas.EdgeType.TESTS.value,
+                weight=float(candidate["weight"]),
+                evidence=dict(candidate["evidence"]),
+                created_at=created_at,
+            )
+            created_edges += 1
+
+        return created_edges, coverage_warnings
+
+    def _store_coverage_test_edges(
+        self,
+        *,
+        analysis_id: str,
+        symbols_by_file_path: dict[str, list[models.Symbol]],
+        edge_candidates: dict[tuple[str, str], dict[str, object]],
+        coverage_contexts_by_file: dict[str, dict[int, tuple[str, ...]]],
+    ) -> int:
+        if not coverage_contexts_by_file:
+            return 0
+
+        code_files = self.artifact_repository.list_code_files(analysis_id)
+        code_file_by_id = {code_file.file_id: code_file for code_file in code_files}
+        symbols = self.artifact_repository.list_symbols(analysis_id)
+        test_symbols = [
+            TestSymbolNode(
+                symbol_id=symbol.symbol_id,
+                symbol_key=self._symbol_key(symbol, code_file_by_id),
+                test_name=self._test_name_from_symbol(symbol, code_file_by_id[symbol.file_id].path),
+                symbol_name=symbol.name,
+                symbol_kind=symbol.kind,
+                file_path=code_file_by_id[symbol.file_id].path,
+            )
+            for symbol in symbols
+            if symbol.file_id in code_file_by_id
+            and symbol.kind
+            in {
+                schemas.SymbolKind.TEST_FUNCTION.value,
+                schemas.SymbolKind.TEST_METHOD.value,
+            }
+        ]
+        test_symbols_by_alias: dict[str, list[TestSymbolNode]] = {}
+        for test_symbol in test_symbols:
+            for alias in test_context_aliases(test_symbol):
+                test_symbols_by_alias.setdefault(alias, []).append(test_symbol)
+
+        coverage_edges_added = 0
+        for file_path, line_contexts in coverage_contexts_by_file.items():
+            normalized_path = file_path.replace("\\", "/")
+            if self._is_test_file_path(normalized_path):
+                continue
+            symbols_in_file = symbols_by_file_path.get(normalized_path, [])
+            if not symbols_in_file:
+                continue
+
+            for line_number, contexts in line_contexts.items():
+                target_symbol = self._production_symbol_for_coverage_line(symbols_in_file, line_number)
+                if target_symbol is None:
+                    continue
+
+                matched_test_symbols = self._match_test_symbols_for_contexts(
+                    contexts, test_symbols_by_alias
+                )
+                for test_symbol in matched_test_symbols:
+                    coverage_edges_added += 1
+                    self._store_test_edge_candidate(
+                        edge_candidates,
+                        source_symbol_id=test_symbol.symbol_id,
+                        target_symbol_id=target_symbol.symbol_id,
+                        weight=1.00,
+                        evidence={
+                            "edge_type": schemas.EdgeType.TESTS.value,
+                            "file_path": normalized_path,
+                            "line": line_number,
+                            "detail": (
+                                f"coverage context for {test_symbol.test_name} hits {normalized_path}:{line_number}"
+                            ),
+                            "coverage_backed": True,
+                        },
+                    )
+
+        return coverage_edges_added
+
+    def _persist_test_recommendations(
+        self,
+        *,
+        analysis_id: str,
+        include_tests: bool,
+    ) -> dict[str, int]:
+        if not include_tests:
+            return {
+                "recommended_tests": 0,
+                "high_confidence_test_recommendations": 0,
+            }
+
+        code_files = self.artifact_repository.list_code_files(analysis_id)
+        code_file_by_id = {code_file.file_id: code_file for code_file in code_files}
+        symbols = self.artifact_repository.list_symbols(analysis_id)
+        symbol_by_id = {symbol.symbol_id: symbol for symbol in symbols}
+        test_symbols = [
+            TestSymbolNode(
+                symbol_id=symbol.symbol_id,
+                symbol_key=self._symbol_key(symbol, code_file_by_id),
+                test_name=self._test_name_from_symbol(symbol, code_file_by_id[symbol.file_id].path),
+                symbol_name=symbol.name,
+                symbol_kind=symbol.kind,
+                file_path=code_file_by_id[symbol.file_id].path,
+            )
+            for symbol in symbols
+            if symbol.file_id in code_file_by_id
+            and symbol.kind
+            in {
+                schemas.SymbolKind.TEST_FUNCTION.value,
+                schemas.SymbolKind.TEST_METHOD.value,
+            }
+        ]
+        if not test_symbols:
+            return {
+                "recommended_tests": 0,
+                "high_confidence_test_recommendations": 0,
+            }
+
+        impacts = [
+            RecommendationImpactNode(
+                symbol_id=impact.symbol_id,
+                symbol_key=impact.symbol_key,
+                symbol_name=impact.symbol_name,
+                symbol_kind=impact.symbol_kind,
+                file_path=impact.file_path,
+                score=impact.score,
+                confidence=impact.confidence,
+                explanation_path=tuple(impact.explanation_path),
+                hop_count=int(impact.reasons_json.get("hop_count", 0)),
+                merged_paths_count=int(impact.reasons_json.get("merged_paths_count", 1)),
+                reasons_json=impact.reasons_json,
+            )
+            for impact in self.impact_repository.list_impacts(analysis_id)
+        ]
+        if not impacts:
+            return {
+                "recommended_tests": 0,
+                "high_confidence_test_recommendations": 0,
+            }
+
+        test_edges = [
+            TestEdgeNode(
+                src_test_symbol_id=edge.src_symbol_id,
+                dst_symbol_id=edge.dst_symbol_id,
+                dst_symbol_kind=symbol_by_id[edge.dst_symbol_id].kind,
+                dst_file_path=code_file_by_id[symbol_by_id[edge.dst_symbol_id].file_id].path,
+                weight=edge.weight,
+                coverage_backed=bool((edge.evidence or {}).get("coverage_backed", False)),
+                evidence=edge.evidence or {},
+            )
+            for edge in self.artifact_repository.list_edges(analysis_id)
+            if edge.edge_type == schemas.EdgeType.TESTS.value
+            and edge.dst_symbol_id in symbol_by_id
+            and symbol_by_id[edge.dst_symbol_id].file_id in code_file_by_id
+        ]
+
+        recommendations = recommend_tests(
+            test_symbols=test_symbols,
+            impacts=impacts,
+            test_edges=test_edges,
+        )
+        for rank, recommendation in enumerate(recommendations, start=1):
+            self.analysis_repository.create_test_recommendation(
+                analysis_id=analysis_id,
+                test_symbol_id=recommendation.test_symbol_id,
+                test_name=recommendation.test_name,
+                file_path=recommendation.file_path,
+                score=recommendation.score,
+                confidence=recommendation.confidence,
+                priority=recommendation.priority,
+                reason=recommendation.reason,
+                reasons_json=recommendation.reasons_json,
+                coverage_backed=recommendation.coverage_backed,
+                rank=rank,
+            )
+
+        return {
+            "recommended_tests": len(recommendations),
+            "high_confidence_test_recommendations": sum(
+                1
+                for recommendation in recommendations
+                if recommendation.confidence == schemas.Confidence.HIGH.value
+            ),
         }
 
     def _persist_final_impacts(
@@ -715,6 +1032,7 @@ class AnalysisService:
             f"- Impacted tests: {result.summary.impacted_tests}",
             f"- Propagation paths: {result.summary.propagation_paths}",
             f"- Recommended tests: {result.summary.recommended_tests}",
+            f"- High-confidence test recommendations: {result.summary.high_confidence_test_recommendations}",
             f"- Skipped files: {result.summary.skipped_files}",
             f"- Parse failures: {result.summary.parse_failures}",
             f"- Scanned Python files: {result.summary.scanned_files}",
@@ -755,13 +1073,23 @@ class AnalysisService:
             lines.append("")
         else:
             lines.extend(["- No final impacts were scored.", ""])
+        lines.extend(["## Test Recommendations", ""])
+        if result.test_suggestions:
+            lines.extend(
+                f"- `{item.test_name}` (score {item.score:.4f}, {item.confidence.value}, "
+                f"coverage_backed={str(item.coverage_backed).lower()})"
+                for item in result.test_suggestions[:10]
+            )
+            lines.append("")
+        else:
+            lines.extend(["- No test recommendations were generated.", ""])
         lines.extend(
             [
                 "## Limitations",
                 "",
-                "- P5 scores only imports, inheritance, and containment-based propagation.",
-                "- P5 does not run calls analysis, coverage-backed scoring, or test recommendation.",
-                "- P5 scores against the current working-tree symbol graph rather than a historical snapshot graph.",
+                "- P6 still does not run calls analysis.",
+                "- P6 test recommendations rely on structural relations, optional coverage contexts, and conservative naming fallback.",
+                "- P6 still scores against the current working-tree symbol graph rather than a historical snapshot graph.",
                 "",
             ]
         )
@@ -833,8 +1161,11 @@ class AnalysisService:
                 test_symbol_id=item.test_symbol_id,
                 test_name=item.test_name,
                 file_path=item.file_path,
+                score=item.score,
+                confidence=item.confidence,
                 priority=item.priority,
                 reason=item.reason,
+                reasons_json=item.reasons_json,
                 coverage_backed=item.coverage_backed,
             )
             for item in self.analysis_repository.list_test_recommendations(analysis.analysis_id)
@@ -851,3 +1182,84 @@ class AnalysisService:
             test_suggestions=test_suggestions,
             warnings=warning_adapter.validate_python(analysis.warnings or []),
         )
+
+    def _store_test_edge_candidate(
+        self,
+        candidates: dict[tuple[str, str], dict[str, object]],
+        *,
+        source_symbol_id: str,
+        target_symbol_id: str,
+        weight: float,
+        evidence: dict[str, object],
+    ) -> None:
+        key = (source_symbol_id, target_symbol_id)
+        current = candidates.get(key)
+        coverage_backed = bool(evidence.get("coverage_backed", False))
+        if current is None:
+            candidates[key] = {"weight": weight, "evidence": evidence}
+            return
+        current_coverage_backed = bool(dict(current["evidence"]).get("coverage_backed", False))
+        if coverage_backed and not current_coverage_backed:
+            candidates[key] = {"weight": weight, "evidence": evidence}
+            return
+        if weight > float(current["weight"]):
+            candidates[key] = {"weight": weight, "evidence": evidence}
+
+    def _production_symbol_for_coverage_line(
+        self, symbols: list[models.Symbol], line_number: int
+    ) -> models.Symbol | None:
+        module_symbol = next(
+            (symbol for symbol in symbols if symbol.kind == schemas.SymbolKind.MODULE.value),
+            None,
+        )
+        candidates = [
+            symbol
+            for symbol in symbols
+            if symbol.kind
+            not in {
+                schemas.SymbolKind.MODULE.value,
+                schemas.SymbolKind.TEST_FUNCTION.value,
+                schemas.SymbolKind.TEST_METHOD.value,
+            }
+            and symbol.start_line <= line_number <= symbol.end_line
+        ]
+        if candidates:
+            return min(
+                candidates,
+                key=lambda symbol: (
+                    symbol.end_line - symbol.start_line,
+                    -(symbol.start_line),
+                ),
+            )
+        return module_symbol
+
+    def _match_test_symbols_for_contexts(
+        self,
+        contexts: tuple[str, ...],
+        test_symbols_by_alias: dict[str, list[TestSymbolNode]],
+    ) -> list[TestSymbolNode]:
+        matched: dict[str, TestSymbolNode] = {}
+        for context in contexts:
+            normalized = context.split("|", maxsplit=1)[0]
+            for alias, test_symbols in test_symbols_by_alias.items():
+                if (
+                    normalized == alias
+                    or normalized.startswith(f"{alias}[")
+                    or normalized.startswith(f"{alias}|")
+                ):
+                    for test_symbol in test_symbols:
+                        matched[test_symbol.symbol_id] = test_symbol
+        return list(matched.values())
+
+    def _test_name_from_symbol(self, symbol: models.Symbol, file_path: str) -> str:
+        if symbol.kind == schemas.SymbolKind.TEST_FUNCTION.value:
+            return f"{file_path}::{symbol.name}"
+        if symbol.kind == schemas.SymbolKind.TEST_METHOD.value:
+            qualname_parts = symbol.qualname.split(".")
+            class_name = qualname_parts[-2] if len(qualname_parts) >= 2 else "Test"
+            return f"{file_path}::{class_name}::{symbol.name}"
+        return f"{file_path}::{symbol.qualname}"
+
+    def _is_test_file_path(self, file_path: str) -> bool:
+        path = file_path.replace("\\", "/")
+        return path.startswith("tests/") or Path(path).name.startswith("test_")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -59,6 +60,7 @@ def create_analysis(
     diff_mode: str = "working_tree",
     include_untracked: bool = False,
     max_depth: int = 4,
+    use_coverage: bool = False,
     commit_from: str | None = None,
     commit_to: str | None = None,
     base_ref: str | None = None,
@@ -68,7 +70,7 @@ def create_analysis(
         "repository_id": repository_id,
         "diff_mode": diff_mode,
         "include_untracked": include_untracked,
-        "options": {"max_depth": max_depth, "include_tests": True, "use_coverage": False},
+        "options": {"max_depth": max_depth, "include_tests": True, "use_coverage": use_coverage},
     }
     if commit_from is not None:
         payload["commit_from"] = commit_from
@@ -134,7 +136,7 @@ def test_create_and_get_analysis_success(
     result = get_analysis_result(accepted["analysis_id"], test_session_factory)
     assert result["status"] == "COMPLETED"
     assert result["summary"]["changed_files"] == 0
-    assert result["warnings"][0]["code"] == "P5_LIMITED_IMPACT_ENGINE"
+    assert result["warnings"][0]["code"] == "P6_LIMITED_IMPACT_ENGINE"
 
     with test_session_factory() as session:
         stored = session.get(models.Analysis, accepted["analysis_id"])
@@ -156,7 +158,7 @@ def test_report_returns_markdown_from_persisted_records(
     assert "# Change Impact Analysis Report" in report
     assert "sample-service" in report
     assert analysis_id in report
-    assert "P5 does not run calls analysis" in report
+    assert "P6 still does not run calls analysis" in report
 
 
 def write_sample_python_package(repo_path: Path) -> None:
@@ -203,6 +205,47 @@ def write_sample_python_package(repo_path: Path) -> None:
     (ignored / "ignored.py").write_text("def should_not_scan(): pass", encoding="utf-8")
 
 
+def write_coverage_json(
+    repo_path: Path,
+    *,
+    file_path: str,
+    line_numbers: list[int],
+    test_context: str,
+) -> None:
+    payload = {
+        "meta": {"format": 2},
+        "files": {
+            file_path: {
+                "executed_lines": line_numbers,
+                "contexts": {str(line): [test_context] for line in line_numbers},
+            }
+        },
+    }
+    (repo_path / "coverage.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def write_service_with_test(repo_path: Path) -> None:
+    tests_dir = repo_path / "tests"
+    tests_dir.mkdir()
+    (repo_path / "service.py").write_text(
+        "def target():\n    return 'old'\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_service.py").write_text(
+        "\n".join(
+            [
+                "from service import target",
+                "",
+                "",
+                "def test_target():",
+                "    assert target() == 'old'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_analysis_for_repo(
     repo_path: Path,
     session_factory: sessionmaker[Session],
@@ -210,6 +253,7 @@ def run_analysis_for_repo(
     diff_mode: str = "working_tree",
     include_untracked: bool = False,
     max_depth: int = 4,
+    use_coverage: bool = False,
     commit_from: str | None = None,
     commit_to: str | None = None,
     base_ref: str | None = None,
@@ -222,6 +266,7 @@ def run_analysis_for_repo(
         diff_mode=diff_mode,
         include_untracked=include_untracked,
         max_depth=max_depth,
+        use_coverage=use_coverage,
         commit_from=commit_from,
         commit_to=commit_to,
         base_ref=base_ref,
@@ -350,6 +395,10 @@ def impacted_symbol_keys(result: dict) -> set[str]:
 
 def impacts_by_key(result: dict) -> dict[str, dict]:
     return {item["symbol_key"]: item for item in result["impacts"]}
+
+
+def suggestion_items_by_name(result: dict) -> dict[str, dict]:
+    return {item["test_name"]: item for item in result["test_suggestions"]}
 
 
 def test_working_tree_diff_maps_changed_lines_to_symbols(
@@ -908,3 +957,127 @@ def test_impacted_test_symbol_is_scored_and_counted(
     assert impacts[test_key]["score"] > 0.0
     assert impacts[test_key]["reasons_json"]["is_test_symbol"] is True
     assert result["summary"]["impacted_tests"] >= 1
+
+
+def test_static_test_recommendations_are_generated_without_coverage(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    write_service_with_test(repo_path)
+    commit_all(repo_path, "add service test pair")
+    (repo_path / "service.py").write_text(
+        "def target():\n    return 'new'\n",
+        encoding="utf-8",
+    )
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    suggestions = suggestion_items_by_name(result)
+    suggestion = suggestions["tests/test_service.py::test_target"]
+
+    assert result["summary"]["recommended_tests"] >= 1
+    assert result["summary"]["high_confidence_test_recommendations"] >= 1
+    assert suggestion["coverage_backed"] is False
+    assert suggestion["score"] == pytest.approx(0.9)
+    assert suggestion["confidence"] == "high"
+    assert suggestion["reasons_json"]["relation_type"] == "tests_edge_module"
+    assert suggestion["reasons_json"]["is_direct_test_hit"] is True
+    assert not any(warning["code"] == "NO_COVERAGE_DATA" for warning in result["warnings"])
+
+    with test_session_factory() as session:
+        test_edges = list(
+            session.execute(
+                select(models.Edge).where(
+                    models.Edge.analysis_id == accepted["analysis_id"],
+                    models.Edge.edge_type == schemas.EdgeType.TESTS.value,
+                )
+            ).scalars()
+        )
+        recommendations = list(
+            session.execute(
+                select(models.TestRecommendation).where(
+                    models.TestRecommendation.analysis_id == accepted["analysis_id"]
+                )
+            ).scalars()
+        )
+        assert any(edge.weight == pytest.approx(0.9) for edge in test_edges)
+        assert any(
+            row.test_name == "tests/test_service.py::test_target" for row in recommendations
+        )
+
+
+def test_missing_coverage_warns_and_still_returns_recommendations(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    write_service_with_test(repo_path)
+    commit_all(repo_path, "add service test pair")
+    (repo_path / "service.py").write_text(
+        "def target():\n    return 'new'\n",
+        encoding="utf-8",
+    )
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory, use_coverage=True)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    suggestions = suggestion_items_by_name(result)
+
+    assert "tests/test_service.py::test_target" in suggestions
+    assert result["summary"]["recommended_tests"] >= 1
+    assert any(warning["code"] == "NO_COVERAGE_DATA" for warning in result["warnings"])
+    assert suggestions["tests/test_service.py::test_target"]["coverage_backed"] is False
+
+
+def test_coverage_data_enhances_test_recommendation_score(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    write_service_with_test(repo_path)
+    commit_all(repo_path, "add service test pair")
+    (repo_path / "service.py").write_text(
+        "def target():\n    return 'new'\n",
+        encoding="utf-8",
+    )
+
+    repo_record = create_repository(repo_path, test_session_factory)
+    baseline = create_analysis(
+        repo_record["repository_id"],
+        test_session_factory,
+        use_coverage=False,
+    )
+    baseline_result = analysis_result(baseline["analysis_id"], test_session_factory)
+    baseline_suggestion = suggestion_items_by_name(baseline_result)[
+        "tests/test_service.py::test_target"
+    ]
+
+    write_coverage_json(
+        repo_path,
+        file_path="service.py",
+        line_numbers=[1, 2],
+        test_context="tests/test_service.py::test_target",
+    )
+    covered = create_analysis(
+        repo_record["repository_id"],
+        test_session_factory,
+        use_coverage=True,
+    )
+    covered_result = analysis_result(covered["analysis_id"], test_session_factory)
+    covered_suggestion = suggestion_items_by_name(covered_result)[
+        "tests/test_service.py::test_target"
+    ]
+
+    assert covered_suggestion["score"] > baseline_suggestion["score"]
+    assert covered_suggestion["score"] == pytest.approx(1.0)
+    assert covered_suggestion["coverage_backed"] is True
+    assert covered_suggestion["reasons_json"]["whether_coverage_used"] is True
+    assert covered_suggestion["reasons_json"]["relation_type"] == "coverage_tests_edge"
+
+    with test_session_factory() as session:
+        recommendations = list(
+            session.execute(
+                select(models.TestRecommendation).where(
+                    models.TestRecommendation.analysis_id == covered["analysis_id"]
+                )
+            ).scalars()
+        )
+        assert any(row.coverage_backed for row in recommendations)
+        assert any(row.score == pytest.approx(1.0) for row in recommendations)

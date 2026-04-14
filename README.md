@@ -1,6 +1,6 @@
 # B-Impact
 
-B-Impact is the V1 implementation for a Python repository change-impact analyzer. P5.5 provides repository registration, SQLite persistence, analysis task lifecycle storage, Python file scanning, AST-based symbol extraction, Git diff reading, changed symbol mapping, baseline impact propagation, deterministic final impact scoring, and a frontend workbench that can create repositories, run analyses, and display real summary, impact, and report data without implementing call graph propagation, coverage, test recommendation ranking, or historical snapshot graphs.
+B-Impact is the V1 implementation for a Python repository change-impact analyzer. P6 provides repository registration, SQLite persistence, analysis task lifecycle storage, Python file scanning, AST-based symbol extraction, Git diff reading, changed symbol mapping, baseline impact propagation, deterministic final impact scoring, persisted test relations, optional coverage-context enhancement, explainable test recommendation ranking, and a frontend workbench that can create repositories, run analyses, and display real summary, impact, and report data without implementing call graph propagation or historical snapshot graphs.
 
 The implementation follows:
 
@@ -12,10 +12,11 @@ The implementation follows:
 - `docs/ADR/0004-p3-git-diff-and-changed-symbol-mapping.md`
 - `docs/ADR/0005-p4-baseline-impact-propagation.md`
 - `docs/ADR/0006-p5-impact-scoring-and-finalization.md`
+- `docs/ADR/0007-p6-tests-coverage-and-recommendation.md`
 
 ## Current Scope
 
-P5.5 includes:
+P6 includes:
 
 - FastAPI backend under `backend/`
 - Pydantic schemas aligned with ADR 0001 through ADR 0006
@@ -38,19 +39,21 @@ P5.5 includes:
 - Deterministic final impact scoring with seed scores, structural edge weights, hop decay, and test-symbol bonus
 - Persisted final `Impact` rows with `score`, `confidence`, `reasons`, `explanation_path`, and `reasons_json`
 - Multi-path merge into one final ranked result per target symbol
+- Persisted `tests` edges from static imports and optional coverage contexts
+- Baseline test recommendations with `score`, `confidence`, `priority`, `coverage_backed`, and explainable `reasons_json`
+- Graceful coverage fallback when `coverage.json` is missing or lacks usable per-test contexts
 - Versioned API routes under `/api/v1`
 - React + Vite frontend under `frontend/`
 - Frontend workbench with repository creation, analysis creation, local recent-item history, analysis summary display, final impact list, and Markdown report viewer
 - Health endpoint, repository registration, analysis creation, analysis detail, and Markdown report routes
-- Backend tests for health, repository validation, analysis creation/querying, report output, symbol extraction, import edges, local parse failures, Git diff modes, changed symbol mapping, propagation over imports/inherits/contains, cycle handling, hop limits, impacted test detection, scoring weights, hop decay, multi-path merge, and added/deleted file behavior
+- Backend tests for health, repository validation, analysis creation/querying, report output, symbol extraction, import edges, local parse failures, Git diff modes, changed symbol mapping, propagation over imports/inherits/contains, cycle handling, hop limits, impacted test detection, scoring weights, hop decay, multi-path merge, added/deleted file behavior, and baseline plus coverage-enhanced test recommendations
 
-P5.5 does not include:
+P6 does not include:
 
 - call graph extraction
-- coverage-backed test recommendation
-- test recommendation generation
 - historical ref-specific symbol graphs
 - multi-language support
+- fixture-aware or optimizer-style test selection
 
 ## Requirements
 
@@ -89,7 +92,7 @@ cd backend
 python3 -c "from app.db.session import init_db; init_db()"
 ```
 
-Local development note: migrations are deferred while the model surface is still changing. If you have a database created before P5.5, recreate it by removing `backend/data/b-impact.sqlite3` and starting the backend again.
+Local development note: migrations are deferred while the model surface is still changing. If you have a database created before P6, recreate it by removing `backend/data/b-impact.sqlite3` and starting the backend again.
 
 Start the API:
 
@@ -138,7 +141,7 @@ The Vite dev server proxies `/api` requests to `http://127.0.0.1:8000`.
 Current frontend capability:
 
 - create a repository from a local path
-- run a real analysis against the current P5 backend
+- run a real analysis against the current P6 backend
 - reload a prior analysis by ID
 - keep recent repositories and analyses in browser-local storage
 - display summary metrics, ranked impacts, warnings, and the Markdown report
@@ -146,8 +149,9 @@ Current frontend capability:
 Current frontend limits:
 
 - recent repository and analysis history is browser-local, not server-side list data
-- there is no graph view, test suggestion panel, or coverage visualization yet
-- there is no multi-page route structure yet; P5.5 is a focused single-page workbench
+- there is no graph view or coverage visualization yet
+- the current workbench does not render a dedicated test recommendation panel yet, even though the backend now returns `test_suggestions`
+- there is no multi-page route structure yet; P6 is still a focused single-page workbench
 
 ## API Flow
 
@@ -178,7 +182,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyses \
   }'
 ```
 
-The accepted response returns `PENDING`. P5 then scans Python files, extracts symbols and supported edges, reads Git diff data, maps changed Python line ranges to symbols, generates baseline impacted symbol candidates, scores final impacts, records local parse failures or unmapped changes, and stores the analysis as `COMPLETED` unless orchestration or persistence fails. P5.5 renders those persisted results directly in the frontend workbench.
+The accepted response returns `PENDING`. P6 then scans Python files, extracts symbols and supported edges, reads Git diff data, maps changed Python line ranges to symbols, generates baseline impacted symbol candidates, scores final impacts, builds static `tests` edges, optionally strengthens them from supported `coverage.json` contexts, ranks final test recommendations, records local parse failures or unmapped changes, and stores the analysis as `COMPLETED` unless orchestration or persistence fails. The current frontend renders persisted summary, impact, warning, and report data directly from that backend state.
 
 Supported diff modes:
 
@@ -211,6 +215,8 @@ The analysis result includes diff, mapping, propagation, and scoring summary fie
 - `high_confidence_impacts`
 - `impacted_tests`
 - `propagation_paths`
+- `recommended_tests`
+- `high_confidence_test_recommendations`
 
 The analysis result also includes extraction summary fields:
 
@@ -220,7 +226,7 @@ The analysis result also includes extraction summary fields:
 - `extracted_symbols`
 - `extracted_edges`
 
-Propagation and scoring rules in P5:
+Propagation, scoring, and recommendation rules in P6:
 
 - `imports`: propagate in reverse from imported module to importer module
 - `inherits`: propagate in reverse from base class to subclass
@@ -235,12 +241,24 @@ Propagation and scoring rules in P5:
 - `contains` weight: `0.40`
 - confidence thresholds: `high >= 0.75`, `medium >= 0.45`, otherwise `low`
 - multiple paths merge into one final impact; public score keeps the best path score, then applies the optional test-symbol bonus
+- static `tests` edge weight: `0.90`
+- coverage-backed `tests` edge weight: `1.00`
+- recommendation confidence thresholds reuse the same `high` / `medium` / `low` score mapping
+- without usable coverage contexts, recommendations fall back to impacted test hits, structural test relations, and conservative naming proximity
 
-P5 and P5.5 return:
+P6 returns:
 
 - `changed_symbols`: changed symbol records from diff mapping
 - `impacted_symbols`: baseline candidate impacted symbols with source symbol, path, hop count, and traversed edge types
 - `impacts`: final ranked impacts with `score`, `confidence`, merged reasons, explanation path, and explainable `reasons_json`
+- `test_suggestions`: ranked test recommendations with `score`, `confidence`, `priority`, `coverage_backed`, and explainable `reasons_json`
+
+Coverage input for `options.use_coverage = true` currently supports:
+
+- `coverage.json` at repository root
+- `coverage/coverage.json` at repository root
+
+The analyzer expects coverage JSON with per-line `contexts`. If the artifact is missing or does not contain usable per-test contexts, the analysis still completes and returns baseline recommendations with a `NO_COVERAGE_DATA` warning.
 
 ## Development Notes
 
@@ -250,5 +268,6 @@ P5 and P5.5 return:
 - Keep P3 diff mapping behavior aligned with `docs/ADR/0004-p3-git-diff-and-changed-symbol-mapping.md`.
 - Keep P4 baseline propagation behavior aligned with `docs/ADR/0005-p4-baseline-impact-propagation.md`.
 - Keep P5 final scoring behavior aligned with `docs/ADR/0006-p5-impact-scoring-and-finalization.md`.
-- Do not add call graph propagation, coverage-backed scoring, test recommendation generation, or multi-language support in P5.5.
+- Keep P6 test recommendation behavior aligned with `docs/ADR/0007-p6-tests-coverage-and-recommendation.md`.
+- Do not add call graph propagation, historical coverage replay, optimizer-style test selection, or multi-language support in P6.
 - Backend errors use the ADR error envelope with `error.code`, `error.message`, `error.details`, and `error.request_id`.

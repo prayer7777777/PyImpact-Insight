@@ -266,8 +266,11 @@ class TestRecommendation(Base):
     test_symbol_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     test_name: Mapped[str] = mapped_column(Text, nullable=False)
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence: Mapped[str] = mapped_column(String(20), nullable=False)
     priority: Mapped[str] = mapped_column(String(20), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
+    reasons_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     coverage_backed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     rank: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
