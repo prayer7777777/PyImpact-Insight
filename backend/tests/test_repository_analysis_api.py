@@ -134,7 +134,7 @@ def test_create_and_get_analysis_success(
     result = get_analysis_result(accepted["analysis_id"], test_session_factory)
     assert result["status"] == "COMPLETED"
     assert result["summary"]["changed_files"] == 0
-    assert result["warnings"][0]["code"] == "P4_NO_SCORING_ENGINE"
+    assert result["warnings"][0]["code"] == "P5_LIMITED_IMPACT_ENGINE"
 
     with test_session_factory() as session:
         stored = session.get(models.Analysis, accepted["analysis_id"])
@@ -156,7 +156,7 @@ def test_report_returns_markdown_from_persisted_records(
     assert "# Change Impact Analysis Report" in report
     assert "sample-service" in report
     assert analysis_id in report
-    assert "P4 does not run calls analysis" in report
+    assert "P5 does not run calls analysis" in report
 
 
 def write_sample_python_package(repo_path: Path) -> None:
@@ -346,6 +346,10 @@ def changed_symbol_keys(result: dict) -> set[str]:
 
 def impacted_symbol_keys(result: dict) -> set[str]:
     return {item["symbol_key"] for item in result["impacted_symbols"]}
+
+
+def impacts_by_key(result: dict) -> dict[str, dict]:
+    return {item["symbol_key"]: item for item in result["impacts"]}
 
 
 def test_working_tree_diff_maps_changed_lines_to_symbols(
@@ -710,3 +714,197 @@ def test_test_symbol_is_recorded_as_impacted_target(
             )
         ).scalars()
         assert any(row.is_test for row in rows)
+
+
+def test_changed_symbol_self_impact_is_high_and_persisted(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "app.py").write_text(
+        "def target():\n    return 'old'\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add app")
+    (repo_path / "app.py").write_text(
+        "def target():\n    return 'new'\n",
+        encoding="utf-8",
+    )
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacts = impacts_by_key(result)
+
+    assert result["impacts"]
+    assert result["summary"]["top_impacts"] == len(result["impacts"])
+    assert result["summary"]["high_confidence_impacts"] >= 1
+    assert "app.py::app.target" in impacts
+    assert impacts["app.py::app.target"]["score"] == pytest.approx(1.0)
+    assert impacts["app.py::app.target"]["confidence"] == "high"
+    assert "changed_symbol" in impacts["app.py::app.target"]["reasons"]
+    assert impacts["app.py::app.target"]["reasons_json"]["matched_from_changed_symbol"] == (
+        "app.py::app.target"
+    )
+    assert impacts["app.py::app.target"]["reasons_json"]["merged_paths_count"] >= 1
+
+    with test_session_factory() as session:
+        rows = session.execute(
+            select(models.Impact).where(models.Impact.analysis_id == accepted["analysis_id"])
+        ).scalars()
+        assert any(row.symbol_key == "app.py::app.target" for row in rows)
+
+
+def test_imports_and_contains_scores_follow_edge_weights(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "core.py").write_text(
+        "\n".join(
+            [
+                "VERSION = 1",
+                "",
+                "def helper():",
+                "    return VERSION",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (repo_path / "consumer.py").write_text(
+        "import core\n\n\ndef use():\n    return core.helper()\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add weighted graph")
+    (repo_path / "core.py").write_text(
+        "\n".join(
+            [
+                "VERSION = 2",
+                "",
+                "def helper():",
+                "    return VERSION",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacts = impacts_by_key(result)
+
+    expected_imports_score = round(0.70 * 0.80 * 0.85, 4)
+    expected_contains_score = round(0.70 * 0.40 * 0.85, 4)
+
+    assert impacts["consumer.py::consumer"]["score"] == pytest.approx(expected_imports_score)
+    assert impacts["core.py::core.helper"]["score"] == pytest.approx(expected_contains_score)
+    assert impacts["consumer.py::consumer"]["score"] > impacts["core.py::core.helper"]["score"]
+
+
+def test_inherits_score_uses_inherits_weight(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "base.py").write_text(
+        "\n".join(
+            [
+                "class Base:",
+                "    pass",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (repo_path / "child.py").write_text(
+        "from base import Base\n\n\nclass Child(Base):\n    pass\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add base child")
+    (repo_path / "base.py").write_text(
+        "\n".join(
+            [
+                "class Base:",
+                "    marker = 1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacts = impacts_by_key(result)
+
+    expected_inherits_score = round(1.00 * 0.75 * 0.85, 4)
+    assert impacts["child.py::child.Child"]["score"] == pytest.approx(expected_inherits_score)
+
+
+def test_hop_decay_lowers_distant_impacts(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "core.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (repo_path / "middle.py").write_text("import core\n", encoding="utf-8")
+    (repo_path / "top.py").write_text("import middle\n", encoding="utf-8")
+    commit_all(repo_path, "add import chain")
+    (repo_path / "core.py").write_text("VERSION = 2\n", encoding="utf-8")
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacts = impacts_by_key(result)
+
+    middle_score = round(0.70 * 0.80 * 0.85, 4)
+    top_score = round(0.70 * 0.80 * 0.80 * (0.85**2), 4)
+
+    assert impacts["middle.py::middle"]["score"] == pytest.approx(middle_score)
+    assert impacts["top.py::top"]["score"] == pytest.approx(top_score)
+    assert impacts["middle.py::middle"]["score"] > impacts["top.py::top"]["score"]
+
+
+def test_multiple_paths_merge_into_one_final_impact(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "a.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (repo_path / "b.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (repo_path / "consumer.py").write_text(
+        "import a\nimport b\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add multi source graph")
+    (repo_path / "a.py").write_text("VERSION = 2\n", encoding="utf-8")
+    (repo_path / "b.py").write_text("VERSION = 2\n", encoding="utf-8")
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacts = impacts_by_key(result)
+    consumer = impacts["consumer.py::consumer"]
+
+    assert consumer["score"] == pytest.approx(round(0.70 * 0.80 * 0.85, 4))
+    assert consumer["reasons_json"]["merged_paths_count"] == 2
+    assert consumer["reasons_json"]["contributing_changed_symbols"] == ["a.py::a", "b.py::b"]
+    assert consumer["reasons_json"]["matched_from_changed_symbol"] == "a.py::a"
+    assert consumer["explanation_path"] == ["a.py::a", "consumer.py::consumer"]
+
+
+def test_impacted_test_symbol_is_scored_and_counted(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    tests_dir = repo_path / "tests"
+    tests_dir.mkdir()
+    (repo_path / "service.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (tests_dir / "test_service.py").write_text(
+        "import service\n\n\ndef test_service_version():\n    assert service.VERSION == 1\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add service and test")
+    (repo_path / "service.py").write_text("VERSION = 2\n", encoding="utf-8")
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacts = impacts_by_key(result)
+    test_key = "tests/test_service.py::tests.test_service.test_service_version"
+
+    assert test_key in impacts
+    assert impacts[test_key]["score"] > 0.0
+    assert impacts[test_key]["reasons_json"]["is_test_symbol"] is True
+    assert result["summary"]["impacted_tests"] >= 1

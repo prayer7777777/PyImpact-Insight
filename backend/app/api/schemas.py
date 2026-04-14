@@ -153,6 +153,8 @@ class AnalysisSummary(BaseModel):
     changed_symbols: int = Field(default=0, ge=0)
     unmapped_changes: int = Field(default=0, ge=0)
     impacted_symbols: int = Field(default=0, ge=0)
+    top_impacts: int = Field(default=0, ge=0)
+    high_confidence_impacts: int = Field(default=0, ge=0)
     impacted_tests: int = Field(default=0, ge=0)
     propagation_paths: int = Field(default=0, ge=0)
     recommended_tests: int = Field(default=0, ge=0)
@@ -192,7 +194,7 @@ class ImpactedSymbolItem(BaseModel):
 
 
 class EvidenceItem(BaseModel):
-    edge_type: EdgeType
+    edge_type: EdgeType | Literal["changed_symbol"]
     file_path: str | None = None
     line: int | None = Field(default=None, ge=1)
     detail: str
@@ -200,8 +202,13 @@ class EvidenceItem(BaseModel):
 
 class ReasonsJson(BaseModel):
     source_symbol: str
+    matched_from_changed_symbol: str
     edge_types: list[EdgeType]
     path_length: int = Field(ge=0)
+    hop_count: int = Field(ge=0)
+    merged_paths_count: int = Field(default=1, ge=1)
+    is_test_symbol: bool = False
+    contributing_changed_symbols: list[str] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
 
 
@@ -213,7 +220,7 @@ class ImpactItem(BaseModel):
     file_path: str
     score: float = Field(ge=0.0, le=1.0)
     confidence: Confidence
-    reasons: list[EdgeType]
+    reasons: list[EdgeType | Literal["changed_symbol"]]
     explanation_path: list[str]
     reasons_json: ReasonsJson
 

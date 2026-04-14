@@ -52,6 +52,38 @@ class ImpactRepository:
         self.session.flush()
         return record
 
+    def create_impact(
+        self,
+        *,
+        analysis_id: str,
+        symbol_id: str,
+        symbol_key: str,
+        symbol_name: str,
+        symbol_kind: str,
+        file_path: str,
+        score: float,
+        confidence: str,
+        reasons: list[str],
+        explanation_path: list[str],
+        reasons_json: dict[str, object],
+    ) -> models.Impact:
+        record = models.Impact(
+            analysis_id=analysis_id,
+            symbol_id=symbol_id,
+            symbol_key=symbol_key,
+            symbol_name=symbol_name,
+            symbol_kind=symbol_kind,
+            file_path=file_path,
+            score=score,
+            confidence=confidence,
+            reasons=reasons,
+            explanation_path=explanation_path,
+            reasons_json=reasons_json,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return record
+
     def list_impacted_symbols(self, analysis_id: str) -> list[models.ImpactedSymbol]:
         statement = (
             select(models.ImpactedSymbol)
@@ -60,6 +92,18 @@ class ImpactRepository:
                 models.ImpactedSymbol.hop_count,
                 models.ImpactedSymbol.file_path,
                 models.ImpactedSymbol.symbol_key,
+            )
+        )
+        return list(self.session.execute(statement).scalars().all())
+
+    def list_impacts(self, analysis_id: str) -> list[models.Impact]:
+        statement = (
+            select(models.Impact)
+            .where(models.Impact.analysis_id == analysis_id)
+            .order_by(
+                models.Impact.score.desc(),
+                models.Impact.file_path,
+                models.Impact.symbol_name,
             )
         )
         return list(self.session.execute(statement).scalars().all())

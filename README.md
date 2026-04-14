@@ -1,6 +1,6 @@
 # B-Impact
 
-B-Impact is the V1 skeleton for a Python repository change-impact analyzer. P4 provides repository registration, SQLite persistence, analysis task lifecycle storage, Python file scanning, AST-based symbol extraction, Git diff reading, changed symbol mapping, and baseline impact propagation over imports, inheritance, and containment edges without implementing call graph propagation, final scoring, coverage, or test recommendation logic.
+B-Impact is the V1 implementation for a Python repository change-impact analyzer. P5 provides repository registration, SQLite persistence, analysis task lifecycle storage, Python file scanning, AST-based symbol extraction, Git diff reading, changed symbol mapping, baseline impact propagation, and deterministic final impact scoring over imports, inheritance, and containment edges without implementing call graph propagation, coverage, test recommendation ranking, or historical snapshot graphs.
 
 The implementation follows:
 
@@ -11,13 +11,14 @@ The implementation follows:
 - `docs/ADR/0003-p2-python-ast-symbol-extraction.md`
 - `docs/ADR/0004-p3-git-diff-and-changed-symbol-mapping.md`
 - `docs/ADR/0005-p4-baseline-impact-propagation.md`
+- `docs/ADR/0006-p5-impact-scoring-and-finalization.md`
 
 ## Current Scope
 
-P4 includes:
+P5 includes:
 
 - FastAPI backend under `backend/`
-- Pydantic schemas aligned with ADR 0001 through ADR 0005
+- Pydantic schemas aligned with ADR 0001 through ADR 0006
 - SQLAlchemy ORM models for `Repository`, `Analysis`, `CodeFile`, `Symbol`, `Edge`, `ChangeSpan`, `ChangedSymbol`, `ImpactedSymbol`, `Impact`, and `TestRecommendation`
 - SQLite persistence for repository, analysis, scanned file, symbol, edge, change span, changed symbol, and impacted symbol records
 - Minimum repository path validation
@@ -34,17 +35,20 @@ P4 includes:
 - Reverse dependency traversal for `imports` and `inherits`
 - Parent/child structural cascade for `contains`
 - Persisted impacted symbol candidates with path, hop count, reason, and test flag
+- Deterministic final impact scoring with seed scores, structural edge weights, hop decay, and test-symbol bonus
+- Persisted final `Impact` rows with `score`, `confidence`, `reasons`, `explanation_path`, and `reasons_json`
+- Multi-path merge into one final ranked result per target symbol
 - Versioned API routes under `/api/v1`
 - React + Vite frontend under `frontend/`
 - Health endpoint, repository registration, analysis creation, analysis detail, and Markdown report routes
-- Backend tests for health, repository validation, analysis creation/querying, report output, symbol extraction, import edges, local parse failures, Git diff modes, changed symbol mapping, propagation over imports/inherits/contains, cycle handling, hop limits, impacted test detection, and added/deleted file behavior
+- Backend tests for health, repository validation, analysis creation/querying, report output, symbol extraction, import edges, local parse failures, Git diff modes, changed symbol mapping, propagation over imports/inherits/contains, cycle handling, hop limits, impacted test detection, scoring weights, hop decay, multi-path merge, and added/deleted file behavior
 
-P4 does not include:
+P5 does not include:
 
 - call graph extraction
-- impact scoring
-- confidence levels
 - coverage-backed test recommendation
+- test recommendation generation
+- historical ref-specific symbol graphs
 - multi-language support
 
 ## Requirements
@@ -84,7 +88,7 @@ cd backend
 python3 -c "from app.db.session import init_db; init_db()"
 ```
 
-Local development note: migrations are deferred while the model surface is still changing. If you have a database created before P4, recreate it by removing `backend/data/b-impact.sqlite3` and starting the backend again.
+Local development note: migrations are deferred while the model surface is still changing. If you have a database created before P5, recreate it by removing `backend/data/b-impact.sqlite3` and starting the backend again.
 
 Start the API:
 
@@ -159,7 +163,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyses \
   }'
 ```
 
-The accepted response returns `PENDING`. P4 then scans Python files, extracts symbols and supported edges, reads Git diff data, maps changed Python line ranges to symbols, generates baseline impacted symbol candidates, records local parse failures or unmapped changes, and stores the analysis as `COMPLETED` unless orchestration or persistence fails.
+The accepted response returns `PENDING`. P5 then scans Python files, extracts symbols and supported edges, reads Git diff data, maps changed Python line ranges to symbols, generates baseline impacted symbol candidates, scores final impacts, records local parse failures or unmapped changes, and stores the analysis as `COMPLETED` unless orchestration or persistence fails.
 
 Supported diff modes:
 
@@ -181,13 +185,15 @@ Read the Markdown report:
 curl http://127.0.0.1:8000/api/v1/analyses/replace-with-analysis-uuid/report
 ```
 
-The analysis result includes diff, mapping, and propagation summary fields:
+The analysis result includes diff, mapping, propagation, and scoring summary fields:
 
 - `changed_files`
 - `changed_python_files`
 - `changed_symbols`
 - `unmapped_changes`
 - `impacted_symbols`
+- `top_impacts`
+- `high_confidence_impacts`
 - `impacted_tests`
 - `propagation_paths`
 
@@ -199,19 +205,27 @@ The analysis result also includes extraction summary fields:
 - `extracted_symbols`
 - `extracted_edges`
 
-Propagation rules in P4:
+Propagation and scoring rules in P5:
 
 - `imports`: propagate in reverse from imported module to importer module
 - `inherits`: propagate in reverse from base class to subclass
 - `contains`: propagate both parent -> child and child -> parent as a structural cascade
 - `max_depth`: limits breadth-first traversal hop count
+- changed non-module symbol seed: `1.00`
+- changed module symbol seed: `0.70`
+- hop decay: `0.85`
+- test symbol bonus: `0.05`
+- `imports` weight: `0.80`
+- `inherits` weight: `0.75`
+- `contains` weight: `0.40`
+- confidence thresholds: `high >= 0.75`, `medium >= 0.45`, otherwise `low`
+- multiple paths merge into one final impact; public score keeps the best path score, then applies the optional test-symbol bonus
 
-P4 returns:
+P5 returns:
 
 - `changed_symbols`: changed symbol records from diff mapping
 - `impacted_symbols`: baseline candidate impacted symbols with source symbol, path, hop count, and traversed edge types
-
-The scored `impacts` list remains empty in P4 because final scoring, confidence, coverage, and test recommendation are not implemented.
+- `impacts`: final ranked impacts with `score`, `confidence`, merged reasons, explanation path, and explainable `reasons_json`
 
 ## Development Notes
 
@@ -220,6 +234,6 @@ The scored `impacts` list remains empty in P4 because final scoring, confidence,
 - Keep P2 parser behavior aligned with `docs/ADR/0003-p2-python-ast-symbol-extraction.md`.
 - Keep P3 diff mapping behavior aligned with `docs/ADR/0004-p3-git-diff-and-changed-symbol-mapping.md`.
 - Keep P4 baseline propagation behavior aligned with `docs/ADR/0005-p4-baseline-impact-propagation.md`.
-- Do not add final scoring, confidence output, coverage, or test recommendation logic in P4.
-- Do not add multi-language support.
+- Keep P5 final scoring behavior aligned with `docs/ADR/0006-p5-impact-scoring-and-finalization.md`.
+- Do not add call graph propagation, coverage-backed scoring, test recommendation generation, or multi-language support in P5.
 - Backend errors use the ADR error envelope with `error.code`, `error.message`, `error.details`, and `error.request_id`.

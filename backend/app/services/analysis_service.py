@@ -7,7 +7,18 @@ from pydantic import TypeAdapter
 from sqlalchemy.orm import Session
 
 from app.analyzers.git_diff import ChangedFile, ChangedLineRange, GitDiffError, GitDiffReader
-from app.analyzers.impact_propagation import ChangedSeed, EdgeLink, SymbolNode, propagate_impacts
+from app.analyzers.impact_propagation import (
+    ChangedSeed as PropagationChangedSeed,
+    EdgeLink as PropagationEdgeLink,
+    SymbolNode as PropagationSymbolNode,
+    propagate_impacts,
+)
+from app.analyzers.impact_scoring import (
+    ChangedSeed as ScoringChangedSeed,
+    EdgeLink as ScoringEdgeLink,
+    SymbolNode as ScoringSymbolNode,
+    score_impacts,
+)
 from app.analyzers.python_ast_parser import ParsedPythonFile, PythonAstParser
 from app.analyzers.python_scanner import scan_python_files
 from app.api import schemas
@@ -26,6 +37,8 @@ ZERO_SUMMARY = {
     "changed_symbols": 0,
     "unmapped_changes": 0,
     "impacted_symbols": 0,
+    "top_impacts": 0,
+    "high_confidence_impacts": 0,
     "impacted_tests": 0,
     "propagation_paths": 0,
     "recommended_tests": 0,
@@ -38,9 +51,9 @@ ZERO_SUMMARY = {
     "extracted_edges": 0,
 }
 
-NO_IMPACT_ENGINE_WARNING = {
-    "code": "P4_NO_SCORING_ENGINE",
-    "message": "P4 generates baseline impacted symbol candidates from imports, inheritance, and containment edges but does not run calls analysis, scoring, coverage, or test recommendation.",
+LIMITED_IMPACT_ENGINE_WARNING = {
+    "code": "P5_LIMITED_IMPACT_ENGINE",
+    "message": "P5 scores changed and structurally propagated symbols through imports, inheritance, and containment edges with deterministic hop decay, but it does not use calls, coverage, test recommendation, or historical snapshot graphs.",
 }
 
 
@@ -196,10 +209,14 @@ class AnalysisService:
             symbols_by_file_path=symbols_by_file_path,
             created_at=now,
         )
-        impact_summary = self._persist_impact_candidates(
+        impact_candidate_summary = self._persist_impact_candidates(
             analysis_id=analysis.analysis_id,
             max_depth=int((analysis.options or {}).get("max_depth", 4)),
             created_at=now,
+        )
+        final_impact_summary = self._persist_final_impacts(
+            analysis_id=analysis.analysis_id,
+            max_depth=int((analysis.options or {}).get("max_depth", 4)),
         )
 
         parse_failed_files = sum(
@@ -217,8 +234,9 @@ class AnalysisService:
             }
         )
         summary.update(change_summary)
-        summary.update(impact_summary)
-        warnings = [NO_IMPACT_ENGINE_WARNING.copy()]
+        summary.update(impact_candidate_summary)
+        summary.update(final_impact_summary)
+        warnings = [LIMITED_IMPACT_ENGINE_WARNING.copy()]
         if parse_failed_files:
             failed_paths = [
                 parsed.relative_path
@@ -328,7 +346,7 @@ class AnalysisService:
         code_file_by_id = {code_file.file_id: code_file for code_file in code_files}
         symbols = self.artifact_repository.list_symbols(analysis_id)
         symbol_nodes = [
-            SymbolNode(
+            PropagationSymbolNode(
                 symbol_id=symbol.symbol_id,
                 symbol_key=self._symbol_key(symbol, code_file_by_id),
                 symbol_name=symbol.name,
@@ -340,7 +358,7 @@ class AnalysisService:
             if symbol.file_id in code_file_by_id
         ]
         edge_links = [
-            EdgeLink(
+            PropagationEdgeLink(
                 src_symbol_id=edge.src_symbol_id,
                 dst_symbol_id=edge.dst_symbol_id,
                 edge_type=edge.edge_type,
@@ -349,7 +367,7 @@ class AnalysisService:
         ]
         candidates = propagate_impacts(
             changed_symbols=[
-                ChangedSeed(
+                PropagationChangedSeed(
                     symbol_id=changed_symbol.symbol_id,
                     symbol_key=changed_symbol.symbol_key,
                     symbol_kind=changed_symbol.symbol_kind,
@@ -384,6 +402,95 @@ class AnalysisService:
             "impacted_symbols": len(candidates),
             "impacted_tests": sum(1 for candidate in candidates if candidate.is_test),
             "propagation_paths": len(candidates),
+        }
+
+    def _persist_final_impacts(
+        self,
+        *,
+        analysis_id: str,
+        max_depth: int,
+    ) -> dict[str, int]:
+        changed_symbols = self.change_repository.list_changed_symbols(analysis_id)
+        if not changed_symbols:
+            return {
+                "top_impacts": 0,
+                "high_confidence_impacts": 0,
+                "impacted_tests": 0,
+            }
+
+        code_files = self.artifact_repository.list_code_files(analysis_id)
+        code_file_by_id = {code_file.file_id: code_file for code_file in code_files}
+        symbols = self.artifact_repository.list_symbols(analysis_id)
+        symbol_nodes = [
+            ScoringSymbolNode(
+                symbol_id=symbol.symbol_id,
+                symbol_key=self._symbol_key(symbol, code_file_by_id),
+                symbol_name=symbol.name,
+                symbol_kind=symbol.kind,
+                file_id=symbol.file_id,
+                file_path=code_file_by_id[symbol.file_id].path,
+            )
+            for symbol in symbols
+            if symbol.file_id in code_file_by_id
+        ]
+        edge_links = [
+            ScoringEdgeLink(
+                src_symbol_id=edge.src_symbol_id,
+                dst_symbol_id=edge.dst_symbol_id,
+                edge_type=edge.edge_type,
+                weight=edge.weight,
+                evidence=edge.evidence or {},
+            )
+            for edge in self.artifact_repository.list_edges(analysis_id)
+        ]
+        impacts = score_impacts(
+            changed_symbols=[
+                ScoringChangedSeed(
+                    symbol_id=changed_symbol.symbol_id,
+                    symbol_key=changed_symbol.symbol_key,
+                    symbol_name=changed_symbol.symbol_name,
+                    symbol_kind=changed_symbol.symbol_kind,
+                    file_path=changed_symbol.file_path,
+                    start_line=changed_symbol.start_line,
+                    end_line=changed_symbol.end_line,
+                    is_module_level=changed_symbol.is_module_level,
+                )
+                for changed_symbol in changed_symbols
+            ],
+            symbols=symbol_nodes,
+            edges=edge_links,
+            max_depth=max_depth,
+        )
+
+        for impact in impacts:
+            self.impact_repository.create_impact(
+                analysis_id=analysis_id,
+                symbol_id=impact.symbol_id,
+                symbol_key=impact.symbol_key,
+                symbol_name=impact.symbol_name,
+                symbol_kind=impact.symbol_kind,
+                file_path=impact.file_path,
+                score=impact.score,
+                confidence=impact.confidence,
+                reasons=list(impact.reasons),
+                explanation_path=list(impact.explanation_path),
+                reasons_json=impact.reasons_json,
+            )
+
+        return {
+            "top_impacts": len(impacts),
+            "high_confidence_impacts": sum(
+                1 for impact in impacts if impact.confidence == schemas.Confidence.HIGH.value
+            ),
+            "impacted_tests": sum(
+                1
+                for impact in impacts
+                if impact.symbol_kind
+                in {
+                    schemas.SymbolKind.TEST_FUNCTION.value,
+                    schemas.SymbolKind.TEST_METHOD.value,
+                }
+            ),
         }
 
     def _symbol_key(self, symbol: models.Symbol, code_file_by_id: dict[str, models.CodeFile]) -> str:
@@ -603,6 +710,8 @@ class AnalysisService:
             f"- Changed symbols: {result.summary.changed_symbols}",
             f"- Unmapped changes: {result.summary.unmapped_changes}",
             f"- Impacted symbols: {result.summary.impacted_symbols}",
+            f"- Top impacts: {result.summary.top_impacts}",
+            f"- High-confidence impacts: {result.summary.high_confidence_impacts}",
             f"- Impacted tests: {result.summary.impacted_tests}",
             f"- Propagation paths: {result.summary.propagation_paths}",
             f"- Recommended tests: {result.summary.recommended_tests}",
@@ -636,13 +745,23 @@ class AnalysisService:
             lines.append("")
         else:
             lines.extend(["- No impacted symbol candidates were generated.", ""])
+        lines.extend(["## Final Impacts", ""])
+        if result.impacts:
+            lines.extend(
+                f"- `{item.symbol_key}` (score {item.score:.4f}, {item.confidence.value}, "
+                f"paths {item.reasons_json.merged_paths_count})"
+                for item in result.impacts[:10]
+            )
+            lines.append("")
+        else:
+            lines.extend(["- No final impacts were scored.", ""])
         lines.extend(
             [
                 "## Limitations",
                 "",
-                "- P4 propagates only through imports, inheritance, and containment edges.",
-                "- P4 records candidate impacted symbols and paths but does not calculate scores.",
-                "- P4 does not run calls analysis, coverage, or test recommendation.",
+                "- P5 scores only imports, inheritance, and containment-based propagation.",
+                "- P5 does not run calls analysis, coverage-backed scoring, or test recommendation.",
+                "- P5 scores against the current working-tree symbol graph rather than a historical snapshot graph.",
                 "",
             ]
         )
@@ -707,7 +826,7 @@ class AnalysisService:
                 explanation_path=impact.explanation_path,
                 reasons_json=impact.reasons_json,
             )
-            for impact in self.analysis_repository.list_impacts(analysis.analysis_id)
+            for impact in self.impact_repository.list_impacts(analysis.analysis_id)
         ]
         test_suggestions = [
             schemas.TestSuggestionItem(
