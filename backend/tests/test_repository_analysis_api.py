@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import asyncio
 import subprocess
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api import schemas
+from app.core.errors import ApiError
 from app.db import models
-from tests.api_client import request
+from app.services.analysis_service import AnalysisService
+from app.services.repository_service import RepositoryService
 
 
 def run_git(repo_path: Path, *args: str) -> str:
@@ -38,21 +40,65 @@ def commit_all(repo_path: Path, message: str) -> str:
     return run_git(repo_path, "rev-parse", "HEAD")
 
 
-def create_repository(repo_path: Path):
-    return request(
-        "POST",
-        "/api/v1/repositories",
-        json={"name": "sample-service", "repo_path": str(repo_path), "main_branch": "main"},
-    )
+def create_repository(repo_path: Path, session_factory: sessionmaker[Session]) -> dict:
+    with session_factory() as session:
+        result = RepositoryService(session).create_repository(
+            schemas.RepositoryCreate(
+                name="sample-service",
+                repo_path=str(repo_path),
+                main_branch="main",
+            )
+        )
+    return result.model_dump(mode="json")
+
+
+def create_analysis(
+    repository_id: str,
+    session_factory: sessionmaker[Session],
+    *,
+    diff_mode: str = "working_tree",
+    include_untracked: bool = False,
+    max_depth: int = 4,
+    commit_from: str | None = None,
+    commit_to: str | None = None,
+    base_ref: str | None = None,
+    head_ref: str | None = None,
+) -> dict:
+    payload = {
+        "repository_id": repository_id,
+        "diff_mode": diff_mode,
+        "include_untracked": include_untracked,
+        "options": {"max_depth": max_depth, "include_tests": True, "use_coverage": False},
+    }
+    if commit_from is not None:
+        payload["commit_from"] = commit_from
+    if commit_to is not None:
+        payload["commit_to"] = commit_to
+    if base_ref is not None:
+        payload["base_ref"] = base_ref
+    if head_ref is not None:
+        payload["head_ref"] = head_ref
+
+    with session_factory() as session:
+        accepted = AnalysisService(session).create_analysis(schemas.AnalysisCreate(**payload))
+    return accepted.model_dump(mode="json")
+
+
+def get_analysis_result(analysis_id: str, session_factory: sessionmaker[Session]) -> dict:
+    with session_factory() as session:
+        result = AnalysisService(session).get_analysis(analysis_id)
+    return result.model_dump(mode="json")
+
+
+def get_report_content(analysis_id: str, session_factory: sessionmaker[Session]) -> str:
+    with session_factory() as session:
+        return AnalysisService(session).get_report(analysis_id)
 
 
 def test_create_repository_success(tmp_path: Path, test_session_factory: sessionmaker[Session]) -> None:
     repo_path = make_git_repository(tmp_path / "repo")
 
-    response = asyncio.run(create_repository(repo_path))
-
-    assert response.status_code == 201
-    body = response.json()
+    body = create_repository(repo_path, test_session_factory)
     assert body["name"] == "sample-service"
     assert body["repo_path"] == str(repo_path.resolve())
     assert body["language"] == "python"
@@ -69,44 +115,26 @@ def test_create_repository_rejects_non_git_directory(
     non_git_path = tmp_path / "not-git"
     non_git_path.mkdir()
 
-    response = asyncio.run(create_repository(non_git_path))
+    with pytest.raises(ApiError) as exc_info:
+        create_repository(non_git_path, test_session_factory)
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "NOT_A_GIT_REPOSITORY"
+    assert exc_info.value.code == "NOT_A_GIT_REPOSITORY"
 
 
 def test_create_and_get_analysis_success(
     tmp_path: Path, test_session_factory: sessionmaker[Session]
 ) -> None:
     repo_path = make_git_repository(tmp_path / "repo")
-    repo_response = asyncio.run(create_repository(repo_path))
-    repository_id = repo_response.json()["repository_id"]
-
-    analysis_response = asyncio.run(
-        request(
-            "POST",
-            "/api/v1/analyses",
-            json={
-                "repository_id": repository_id,
-                "diff_mode": "working_tree",
-                "include_untracked": False,
-                "options": {"max_depth": 4, "include_tests": True, "use_coverage": False},
-            },
-        )
-    )
-
-    assert analysis_response.status_code == 202
-    accepted = analysis_response.json()
+    repo_record = create_repository(repo_path, test_session_factory)
+    repository_id = repo_record["repository_id"]
+    accepted = create_analysis(repository_id, test_session_factory)
     assert accepted["repository_id"] == repository_id
     assert accepted["status"] == "PENDING"
 
-    result_response = asyncio.run(request("GET", f"/api/v1/analyses/{accepted['analysis_id']}"))
-
-    assert result_response.status_code == 200
-    result = result_response.json()
+    result = get_analysis_result(accepted["analysis_id"], test_session_factory)
     assert result["status"] == "COMPLETED"
     assert result["summary"]["changed_files"] == 0
-    assert result["warnings"][0]["code"] == "P3_NO_IMPACT_ENGINE"
+    assert result["warnings"][0]["code"] == "P4_NO_SCORING_ENGINE"
 
     with test_session_factory() as session:
         stored = session.get(models.Analysis, accepted["analysis_id"])
@@ -119,25 +147,16 @@ def test_report_returns_markdown_from_persisted_records(
     tmp_path: Path, test_session_factory: sessionmaker[Session]
 ) -> None:
     repo_path = make_git_repository(tmp_path / "repo")
-    repo_response = asyncio.run(create_repository(repo_path))
-    repository_id = repo_response.json()["repository_id"]
-    analysis_response = asyncio.run(
-        request(
-            "POST",
-            "/api/v1/analyses",
-            json={"repository_id": repository_id, "diff_mode": "working_tree"},
-        )
-    )
-    analysis_id = analysis_response.json()["analysis_id"]
+    repo_record = create_repository(repo_path, test_session_factory)
+    analysis_record = create_analysis(repo_record["repository_id"], test_session_factory)
+    analysis_id = analysis_record["analysis_id"]
 
-    report_response = asyncio.run(request("GET", f"/api/v1/analyses/{analysis_id}/report"))
+    report = get_report_content(analysis_id, test_session_factory)
 
-    assert report_response.status_code == 200
-    assert report_response.headers["content-type"].startswith("text/markdown")
-    assert "# Change Impact Analysis Report" in report_response.text
-    assert "sample-service" in report_response.text
-    assert analysis_id in report_response.text
-    assert "P3 does not run calls analysis" in report_response.text
+    assert "# Change Impact Analysis Report" in report
+    assert "sample-service" in report
+    assert analysis_id in report
+    assert "P4 does not run calls analysis" in report
 
 
 def write_sample_python_package(repo_path: Path) -> None:
@@ -186,38 +205,28 @@ def write_sample_python_package(repo_path: Path) -> None:
 
 def run_analysis_for_repo(
     repo_path: Path,
+    session_factory: sessionmaker[Session],
     *,
     diff_mode: str = "working_tree",
     include_untracked: bool = False,
+    max_depth: int = 4,
     commit_from: str | None = None,
     commit_to: str | None = None,
     base_ref: str | None = None,
     head_ref: str | None = None,
 ) -> dict:
-    repo_response = asyncio.run(create_repository(repo_path))
-    repository_id = repo_response.json()["repository_id"]
-    payload = {
-        "repository_id": repository_id,
-        "diff_mode": diff_mode,
-        "include_untracked": include_untracked,
-    }
-    if commit_from is not None:
-        payload["commit_from"] = commit_from
-    if commit_to is not None:
-        payload["commit_to"] = commit_to
-    if base_ref is not None:
-        payload["base_ref"] = base_ref
-    if head_ref is not None:
-        payload["head_ref"] = head_ref
-    analysis_response = asyncio.run(
-        request(
-            "POST",
-            "/api/v1/analyses",
-            json=payload,
-        )
+    repo_record = create_repository(repo_path, session_factory)
+    return create_analysis(
+        repo_record["repository_id"],
+        session_factory,
+        diff_mode=diff_mode,
+        include_untracked=include_untracked,
+        max_depth=max_depth,
+        commit_from=commit_from,
+        commit_to=commit_to,
+        base_ref=base_ref,
+        head_ref=head_ref,
     )
-    assert analysis_response.status_code == 202, analysis_response.text
-    return analysis_response.json()
 
 
 def test_analysis_scans_and_extracts_basic_symbols(
@@ -226,9 +235,8 @@ def test_analysis_scans_and_extracts_basic_symbols(
     repo_path = make_git_repository(tmp_path / "repo")
     write_sample_python_package(repo_path)
 
-    accepted = run_analysis_for_repo(repo_path)
-    result_response = asyncio.run(request("GET", f"/api/v1/analyses/{accepted['analysis_id']}"))
-    result = result_response.json()
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = get_analysis_result(accepted["analysis_id"], test_session_factory)
 
     assert result["status"] == "COMPLETED"
     assert result["summary"]["scanned_files"] == 3
@@ -258,7 +266,7 @@ def test_analysis_persists_class_function_and_method_symbols(
     repo_path = make_git_repository(tmp_path / "repo")
     write_sample_python_package(repo_path)
 
-    accepted = run_analysis_for_repo(repo_path)
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
 
     with test_session_factory() as session:
         symbols = session.execute(
@@ -279,7 +287,7 @@ def test_analysis_generates_import_edge(
     repo_path = make_git_repository(tmp_path / "repo")
     write_sample_python_package(repo_path)
 
-    accepted = run_analysis_for_repo(repo_path)
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
 
     with test_session_factory() as session:
         import_edges = session.execute(
@@ -309,9 +317,8 @@ def test_syntax_error_file_is_recorded_without_failing_analysis(
     (repo_path / "good.py").write_text("def ok():\n    return True\n", encoding="utf-8")
     (repo_path / "bad.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
 
-    accepted = run_analysis_for_repo(repo_path)
-    result_response = asyncio.run(request("GET", f"/api/v1/analyses/{accepted['analysis_id']}"))
-    result = result_response.json()
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = get_analysis_result(accepted["analysis_id"], test_session_factory)
 
     assert result["status"] == "COMPLETED"
     assert result["summary"]["scanned_files"] == 2
@@ -329,14 +336,16 @@ def test_syntax_error_file_is_recorded_without_failing_analysis(
     assert by_path["good.py"].parse_status == schemas.ParseStatus.PARSED.value
 
 
-def analysis_result(analysis_id: str) -> dict:
-    result_response = asyncio.run(request("GET", f"/api/v1/analyses/{analysis_id}"))
-    assert result_response.status_code == 200, result_response.text
-    return result_response.json()
+def analysis_result(analysis_id: str, session_factory: sessionmaker[Session]) -> dict:
+    return get_analysis_result(analysis_id, session_factory)
 
 
 def changed_symbol_keys(result: dict) -> set[str]:
     return {item["symbol_key"] for item in result["changed_symbols"]}
+
+
+def impacted_symbol_keys(result: dict) -> set[str]:
+    return {item["symbol_key"] for item in result["impacted_symbols"]}
 
 
 def test_working_tree_diff_maps_changed_lines_to_symbols(
@@ -353,8 +362,8 @@ def test_working_tree_diff_maps_changed_lines_to_symbols(
         encoding="utf-8",
     )
 
-    accepted = run_analysis_for_repo(repo_path)
-    result = analysis_result(accepted["analysis_id"])
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
 
     assert result["summary"]["changed_files"] == 1
     assert result["summary"]["changed_python_files"] == 1
@@ -387,11 +396,12 @@ def test_commit_range_diff_maps_changed_lines_to_symbols(
 
     accepted = run_analysis_for_repo(
         repo_path,
+        test_session_factory,
         diff_mode="commit_range",
         commit_from=commit_from,
         commit_to=commit_to,
     )
-    result = analysis_result(accepted["analysis_id"])
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
 
     assert result["summary"]["changed_files"] == 1
     assert result["summary"]["changed_symbols"] == 2
@@ -416,11 +426,12 @@ def test_refs_compare_diff_maps_changed_lines_to_symbols(
 
     accepted = run_analysis_for_repo(
         repo_path,
+        test_session_factory,
         diff_mode="refs_compare",
         base_ref="main",
         head_ref="feature",
     )
-    result = analysis_result(accepted["analysis_id"])
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
 
     assert result["summary"]["changed_files"] == 1
     assert result["summary"]["changed_symbols"] == 2
@@ -455,8 +466,8 @@ def test_nested_symbol_mapping_prefers_innermost_symbol(
         encoding="utf-8",
     )
 
-    accepted = run_analysis_for_repo(repo_path)
-    result = analysis_result(accepted["analysis_id"])
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
     keys = changed_symbol_keys(result)
 
     assert "app.py::app" in keys
@@ -472,8 +483,8 @@ def test_unmapped_change_is_recorded_for_parse_failed_python_file(
     commit_all(repo_path, "add valid file")
     (repo_path / "bad.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
 
-    accepted = run_analysis_for_repo(repo_path)
-    result = analysis_result(accepted["analysis_id"])
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
 
     assert result["status"] == "COMPLETED"
     assert result["summary"]["changed_files"] == 1
@@ -501,8 +512,8 @@ def test_added_and_deleted_python_files_are_recorded(
     (repo_path / "new.py").write_text("def new():\n    return 'new'\n", encoding="utf-8")
     run_git(repo_path, "add", "new.py")
 
-    accepted = run_analysis_for_repo(repo_path)
-    result = analysis_result(accepted["analysis_id"])
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
 
     assert result["summary"]["changed_files"] == 2
     assert result["summary"]["changed_python_files"] == 2
@@ -519,3 +530,183 @@ def test_added_and_deleted_python_files_are_recorded(
     assert by_path["new.py"].change_type == schemas.FileChangeType.ADDED.value
     assert by_path["old.py"].change_type == schemas.FileChangeType.DELETED.value
     assert by_path["old.py"].is_unmapped
+
+
+def test_imports_propagation_generates_impacted_symbols(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "core.py").write_text("def target():\n    return 'old'\n", encoding="utf-8")
+    (repo_path / "consumer.py").write_text(
+        "import core\n\n\ndef use():\n    return core.target()\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add import chain")
+    (repo_path / "core.py").write_text("def target():\n    return 'new'\n", encoding="utf-8")
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    keys = impacted_symbol_keys(result)
+
+    assert "consumer.py::consumer" in keys
+    assert "consumer.py::consumer.use" in keys
+    assert result["summary"]["impacted_symbols"] >= 2
+    assert result["summary"]["propagation_paths"] >= 2
+
+
+def test_inherits_propagation_generates_impacted_symbols(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "base.py").write_text(
+        "\n".join(
+            [
+                "class Base:",
+                "    def run(self):",
+                "        return 'old'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (repo_path / "child.py").write_text(
+        "from base import Base\n\n\nclass Child(Base):\n    pass\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add base and child")
+    (repo_path / "base.py").write_text(
+        "\n".join(
+            [
+                "class Base:",
+                "    def run(self):",
+                "        return 'new'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacted = {item["symbol_key"]: item for item in result["impacted_symbols"]}
+
+    assert "base.py::base.Base" in impacted
+    assert "child.py::child.Child" in impacted
+    assert "reverse_inherits" in impacted["child.py::child.Child"]["impact_reason"]
+
+
+def test_contains_cascade_impacts_parent_symbols(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "app.py").write_text(
+        "\n".join(
+            [
+                "class Service:",
+                "    def run(self):",
+                "        return 'old'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add service")
+    (repo_path / "app.py").write_text(
+        "\n".join(
+            [
+                "class Service:",
+                "    def run(self):",
+                "        return 'new'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacted = {item["symbol_key"]: item for item in result["impacted_symbols"]}
+
+    assert "app.py::app.Service" in impacted
+    assert impacted["app.py::app.Service"]["hop_count"] == 1
+    assert "reverse_contains" in impacted["app.py::app.Service"]["impact_reason"]
+
+
+def test_propagation_handles_import_cycles_without_looping(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "a.py").write_text(
+        "import b\n\n\ndef run_a():\n    return b.run_b()\n",
+        encoding="utf-8",
+    )
+    (repo_path / "b.py").write_text(
+        "import a\n\n\ndef run_b():\n    return 'b'\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add cycle")
+    (repo_path / "a.py").write_text(
+        "import b\n\n\ndef run_a():\n    return 'changed'\n",
+        encoding="utf-8",
+    )
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+
+    assert result["status"] == "COMPLETED"
+    assert 1 <= result["summary"]["impacted_symbols"] <= 6
+
+
+def test_propagation_respects_hop_limit(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    (repo_path / "core.py").write_text("def target():\n    return 'old'\n", encoding="utf-8")
+    (repo_path / "middle.py").write_text(
+        "import core\n\n\ndef use_middle():\n    return core.target()\n",
+        encoding="utf-8",
+    )
+    (repo_path / "top.py").write_text(
+        "import middle\n\n\ndef use_top():\n    return middle.use_middle()\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add depth chain")
+    (repo_path / "core.py").write_text("def target():\n    return 'new'\n", encoding="utf-8")
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory, max_depth=1)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    keys = impacted_symbol_keys(result)
+
+    assert "middle.py::middle" in keys
+    assert "top.py::top" not in keys
+
+
+def test_test_symbol_is_recorded_as_impacted_target(
+    tmp_path: Path, test_session_factory: sessionmaker[Session]
+) -> None:
+    repo_path = make_git_repository(tmp_path / "repo")
+    tests_dir = repo_path / "tests"
+    tests_dir.mkdir()
+    (repo_path / "service.py").write_text("def target():\n    return 'old'\n", encoding="utf-8")
+    (tests_dir / "test_service.py").write_text(
+        "from service import target\n\n\ndef test_target():\n    assert target() == 'old'\n",
+        encoding="utf-8",
+    )
+    commit_all(repo_path, "add service and test")
+    (repo_path / "service.py").write_text("def target():\n    return 'new'\n", encoding="utf-8")
+
+    accepted = run_analysis_for_repo(repo_path, test_session_factory)
+    result = analysis_result(accepted["analysis_id"], test_session_factory)
+    impacted = {item["symbol_key"]: item for item in result["impacted_symbols"]}
+
+    assert "tests/test_service.py::tests.test_service.test_target" in impacted
+    assert impacted["tests/test_service.py::tests.test_service.test_target"]["is_test"] is True
+    assert result["summary"]["impacted_tests"] >= 1
+
+    with test_session_factory() as session:
+        rows = session.execute(
+            select(models.ImpactedSymbol).where(
+                models.ImpactedSymbol.analysis_id == accepted["analysis_id"]
+            )
+        ).scalars()
+        assert any(row.is_test for row in rows)

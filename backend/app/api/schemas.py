@@ -153,6 +153,8 @@ class AnalysisSummary(BaseModel):
     changed_symbols: int = Field(default=0, ge=0)
     unmapped_changes: int = Field(default=0, ge=0)
     impacted_symbols: int = Field(default=0, ge=0)
+    impacted_tests: int = Field(default=0, ge=0)
+    propagation_paths: int = Field(default=0, ge=0)
     recommended_tests: int = Field(default=0, ge=0)
     skipped_files: int = Field(default=0, ge=0)
     parse_failures: int = Field(default=0, ge=0)
@@ -172,6 +174,21 @@ class ChangedSymbolItem(BaseModel):
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
     change_type: FileChangeType
+
+
+class ImpactedSymbolItem(BaseModel):
+    symbol_id: UUID
+    source_symbol_id: UUID
+    source_symbol_key: str
+    symbol_key: str
+    symbol_name: str
+    symbol_kind: SymbolKind
+    file_path: str
+    hop_count: int = Field(ge=1)
+    impact_reason: str
+    impact_path: list[str]
+    edge_types: list[EdgeType]
+    is_test: bool
 
 
 class EvidenceItem(BaseModel):
@@ -221,6 +238,7 @@ class AnalysisResult(BaseModel):
     status: AnalysisStatus
     summary: AnalysisSummary
     changed_symbols: list[ChangedSymbolItem] = Field(default_factory=list)
+    impacted_symbols: list[ImpactedSymbolItem] = Field(default_factory=list)
     impacts: list[ImpactItem] = Field(default_factory=list)
     test_suggestions: list[TestSuggestionItem] = Field(default_factory=list)
     warnings: list[WarningMessage] = Field(default_factory=list)

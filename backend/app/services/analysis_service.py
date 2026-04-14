@@ -7,14 +7,16 @@ from pydantic import TypeAdapter
 from sqlalchemy.orm import Session
 
 from app.analyzers.git_diff import ChangedFile, ChangedLineRange, GitDiffError, GitDiffReader
+from app.analyzers.impact_propagation import ChangedSeed, EdgeLink, SymbolNode, propagate_impacts
 from app.analyzers.python_ast_parser import ParsedPythonFile, PythonAstParser
 from app.analyzers.python_scanner import scan_python_files
 from app.api import schemas
 from app.core.errors import ApiError
 from app.db import models
-from app.repositories.change_repository import ChangeRepository
 from app.repositories.analysis_artifact_repository import AnalysisArtifactRepository
 from app.repositories.analysis_repository import AnalysisRepository
+from app.repositories.change_repository import ChangeRepository
+from app.repositories.impact_repository import ImpactRepository
 from app.repositories.repository_repository import RepositoryRepository
 
 
@@ -24,6 +26,8 @@ ZERO_SUMMARY = {
     "changed_symbols": 0,
     "unmapped_changes": 0,
     "impacted_symbols": 0,
+    "impacted_tests": 0,
+    "propagation_paths": 0,
     "recommended_tests": 0,
     "skipped_files": 0,
     "parse_failures": 0,
@@ -35,8 +39,8 @@ ZERO_SUMMARY = {
 }
 
 NO_IMPACT_ENGINE_WARNING = {
-    "code": "P3_NO_IMPACT_ENGINE",
-    "message": "P3 extracts Python symbols, reads Git diff, and maps changed Python lines to symbols but does not run calls analysis, impact propagation, scoring, coverage, or test recommendation.",
+    "code": "P4_NO_SCORING_ENGINE",
+    "message": "P4 generates baseline impacted symbol candidates from imports, inheritance, and containment edges but does not run calls analysis, scoring, coverage, or test recommendation.",
 }
 
 
@@ -46,6 +50,7 @@ class AnalysisService:
         self.analysis_repository = AnalysisRepository(session)
         self.artifact_repository = AnalysisArtifactRepository(session)
         self.change_repository = ChangeRepository(session)
+        self.impact_repository = ImpactRepository(session)
         self.repository_repository = RepositoryRepository(session)
 
     def create_analysis(self, payload: schemas.AnalysisCreate) -> schemas.AnalysisAccepted:
@@ -191,6 +196,11 @@ class AnalysisService:
             symbols_by_file_path=symbols_by_file_path,
             created_at=now,
         )
+        impact_summary = self._persist_impact_candidates(
+            analysis_id=analysis.analysis_id,
+            max_depth=int((analysis.options or {}).get("max_depth", 4)),
+            created_at=now,
+        )
 
         parse_failed_files = sum(
             1 for parsed in parsed_files if parsed.parse_status == schemas.ParseStatus.PARSE_FAILED
@@ -207,6 +217,7 @@ class AnalysisService:
             }
         )
         summary.update(change_summary)
+        summary.update(impact_summary)
         warnings = [NO_IMPACT_ENGINE_WARNING.copy()]
         if parse_failed_files:
             failed_paths = [
@@ -297,6 +308,86 @@ class AnalysisService:
             "unmapped_changes": unmapped_changes,
             "skipped_files": skipped_files,
         }
+
+    def _persist_impact_candidates(
+        self,
+        *,
+        analysis_id: str,
+        max_depth: int,
+        created_at: datetime,
+    ) -> dict[str, int]:
+        changed_symbols = self.change_repository.list_changed_symbols(analysis_id)
+        if not changed_symbols:
+            return {
+                "impacted_symbols": 0,
+                "impacted_tests": 0,
+                "propagation_paths": 0,
+            }
+
+        code_files = self.artifact_repository.list_code_files(analysis_id)
+        code_file_by_id = {code_file.file_id: code_file for code_file in code_files}
+        symbols = self.artifact_repository.list_symbols(analysis_id)
+        symbol_nodes = [
+            SymbolNode(
+                symbol_id=symbol.symbol_id,
+                symbol_key=self._symbol_key(symbol, code_file_by_id),
+                symbol_name=symbol.name,
+                symbol_kind=symbol.kind,
+                file_id=symbol.file_id,
+                file_path=code_file_by_id[symbol.file_id].path,
+            )
+            for symbol in symbols
+            if symbol.file_id in code_file_by_id
+        ]
+        edge_links = [
+            EdgeLink(
+                src_symbol_id=edge.src_symbol_id,
+                dst_symbol_id=edge.dst_symbol_id,
+                edge_type=edge.edge_type,
+            )
+            for edge in self.artifact_repository.list_edges(analysis_id)
+        ]
+        candidates = propagate_impacts(
+            changed_symbols=[
+                ChangedSeed(
+                    symbol_id=changed_symbol.symbol_id,
+                    symbol_key=changed_symbol.symbol_key,
+                    symbol_kind=changed_symbol.symbol_kind,
+                )
+                for changed_symbol in changed_symbols
+            ],
+            symbols=symbol_nodes,
+            edges=edge_links,
+            max_depth=max_depth,
+        )
+
+        for candidate in candidates:
+            self.impact_repository.create_impacted_symbol(
+                analysis_id=analysis_id,
+                source_symbol_id=candidate.source_symbol_id,
+                symbol_id=candidate.symbol_id,
+                file_id=candidate.file_id,
+                source_symbol_key=candidate.source_symbol_key,
+                symbol_key=candidate.symbol_key,
+                symbol_name=candidate.symbol_name,
+                symbol_kind=candidate.symbol_kind,
+                file_path=candidate.file_path,
+                hop_count=candidate.hop_count,
+                impact_reason=candidate.impact_reason,
+                impact_path=list(candidate.impact_path),
+                edge_types=list(candidate.edge_types),
+                is_test=candidate.is_test,
+                created_at=created_at,
+            )
+
+        return {
+            "impacted_symbols": len(candidates),
+            "impacted_tests": sum(1 for candidate in candidates if candidate.is_test),
+            "propagation_paths": len(candidates),
+        }
+
+    def _symbol_key(self, symbol: models.Symbol, code_file_by_id: dict[str, models.CodeFile]) -> str:
+        return f"{code_file_by_id[symbol.file_id].path}::{symbol.qualname}"
 
     def _symbols_for_changed_range(
         self, symbols: list[models.Symbol], line_range: ChangedLineRange | None
@@ -512,6 +603,8 @@ class AnalysisService:
             f"- Changed symbols: {result.summary.changed_symbols}",
             f"- Unmapped changes: {result.summary.unmapped_changes}",
             f"- Impacted symbols: {result.summary.impacted_symbols}",
+            f"- Impacted tests: {result.summary.impacted_tests}",
+            f"- Propagation paths: {result.summary.propagation_paths}",
             f"- Recommended tests: {result.summary.recommended_tests}",
             f"- Skipped files: {result.summary.skipped_files}",
             f"- Parse failures: {result.summary.parse_failures}",
@@ -533,14 +626,24 @@ class AnalysisService:
             lines.append("")
         else:
             lines.extend(["- No changed Python symbols were mapped.", ""])
+        lines.extend(["## Impacted Symbol Candidates", ""])
+        if result.impacted_symbols:
+            lines.extend(
+                f"- `{item.symbol_key}` from `{item.source_symbol_key}` "
+                f"({item.impact_reason}, hops {item.hop_count})"
+                for item in result.impacted_symbols
+            )
+            lines.append("")
+        else:
+            lines.extend(["- No impacted symbol candidates were generated.", ""])
         lines.extend(
             [
-            "## Limitations",
-            "",
-            "- P3 scans the current working tree for Python symbols before mapping diff line ranges.",
-            "- P3 maps changed Python lines to module-level and innermost symbols only.",
-            "- P3 does not run calls analysis, impact propagation, scoring, coverage, or test recommendation.",
-            "",
+                "## Limitations",
+                "",
+                "- P4 propagates only through imports, inheritance, and containment edges.",
+                "- P4 records candidate impacted symbols and paths but does not calculate scores.",
+                "- P4 does not run calls analysis, coverage, or test recommendation.",
+                "",
             ]
         )
         if result.warnings:
@@ -573,6 +676,23 @@ class AnalysisService:
                 change_type=item.change_type,
             )
             for item in self.change_repository.list_changed_symbols(analysis.analysis_id)
+        ]
+        impacted_symbols = [
+            schemas.ImpactedSymbolItem(
+                symbol_id=item.symbol_id,
+                source_symbol_id=item.source_symbol_id,
+                source_symbol_key=item.source_symbol_key,
+                symbol_key=item.symbol_key,
+                symbol_name=item.symbol_name,
+                symbol_kind=item.symbol_kind,
+                file_path=item.file_path,
+                hop_count=item.hop_count,
+                impact_reason=item.impact_reason,
+                impact_path=item.impact_path,
+                edge_types=item.edge_types,
+                is_test=item.is_test,
+            )
+            for item in self.impact_repository.list_impacted_symbols(analysis.analysis_id)
         ]
         impacts = [
             schemas.ImpactItem(
@@ -607,6 +727,7 @@ class AnalysisService:
             status=schemas.AnalysisStatus(analysis.status),
             summary=schemas.AnalysisSummary(**(analysis.summary or ZERO_SUMMARY)),
             changed_symbols=changed_symbols,
+            impacted_symbols=impacted_symbols,
             impacts=impacts,
             test_suggestions=test_suggestions,
             warnings=warning_adapter.validate_python(analysis.warnings or []),

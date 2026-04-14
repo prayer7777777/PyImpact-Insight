@@ -1,6 +1,6 @@
 # B-Impact
 
-B-Impact is the V1 skeleton for a Python repository change-impact analyzer. P3 provides repository registration, SQLite persistence, analysis task lifecycle storage, Python file scanning, AST-based symbol extraction, basic structural/import/inheritance edges, Git diff reading, changed line ranges, changed symbol mapping, and a Markdown report path without implementing call graph extraction, impact propagation, scoring, coverage, or test recommendation logic.
+B-Impact is the V1 skeleton for a Python repository change-impact analyzer. P4 provides repository registration, SQLite persistence, analysis task lifecycle storage, Python file scanning, AST-based symbol extraction, Git diff reading, changed symbol mapping, and baseline impact propagation over imports, inheritance, and containment edges without implementing call graph propagation, final scoring, coverage, or test recommendation logic.
 
 The implementation follows:
 
@@ -10,15 +10,16 @@ The implementation follows:
 - `docs/ADR/0002-p1-persistence-and-analysis-status.md`
 - `docs/ADR/0003-p2-python-ast-symbol-extraction.md`
 - `docs/ADR/0004-p3-git-diff-and-changed-symbol-mapping.md`
+- `docs/ADR/0005-p4-baseline-impact-propagation.md`
 
 ## Current Scope
 
-P3 includes:
+P4 includes:
 
 - FastAPI backend under `backend/`
-- Pydantic schemas aligned with ADR 0001 through ADR 0004
-- SQLAlchemy ORM models for `Repository`, `Analysis`, `CodeFile`, `Symbol`, `Edge`, `ChangeSpan`, `ChangedSymbol`, `Impact`, and `TestRecommendation`
-- SQLite persistence for repository, analysis, scanned file, symbol, edge, change span, and changed symbol records
+- Pydantic schemas aligned with ADR 0001 through ADR 0005
+- SQLAlchemy ORM models for `Repository`, `Analysis`, `CodeFile`, `Symbol`, `Edge`, `ChangeSpan`, `ChangedSymbol`, `ImpactedSymbol`, `Impact`, and `TestRecommendation`
+- SQLite persistence for repository, analysis, scanned file, symbol, edge, change span, changed symbol, and impacted symbol records
 - Minimum repository path validation
 - Analysis lifecycle storage with `PENDING`, `RUNNING`, `COMPLETED`, and `FAILED`
 - Recursive Python file scanning with common generated/dependency directories ignored
@@ -29,16 +30,20 @@ P3 includes:
 - Changed file and changed line range persistence
 - Python-only changed symbol mapping with module-level hits and innermost symbol priority
 - Unmapped change records for Python ranges that cannot be mapped to a persisted symbol
+- Baseline impact propagation from changed symbols
+- Reverse dependency traversal for `imports` and `inherits`
+- Parent/child structural cascade for `contains`
+- Persisted impacted symbol candidates with path, hop count, reason, and test flag
 - Versioned API routes under `/api/v1`
 - React + Vite frontend under `frontend/`
 - Health endpoint, repository registration, analysis creation, analysis detail, and Markdown report routes
-- Backend tests for health, repository registration, validation errors, analysis creation/querying, report output, symbol extraction, import edges, local parse failures, Git diff modes, changed symbol mapping, unmapped changes, and added/deleted file behavior
+- Backend tests for health, repository validation, analysis creation/querying, report output, symbol extraction, import edges, local parse failures, Git diff modes, changed symbol mapping, propagation over imports/inherits/contains, cycle handling, hop limits, impacted test detection, and added/deleted file behavior
 
-P3 does not include:
+P4 does not include:
 
 - call graph extraction
-- impact propagation
 - impact scoring
+- confidence levels
 - coverage-backed test recommendation
 - multi-language support
 
@@ -79,7 +84,7 @@ cd backend
 python3 -c "from app.db.session import init_db; init_db()"
 ```
 
-Local development note: migrations are deferred while the model surface is still changing. If you have a database created before P3, recreate it by removing `backend/data/b-impact.sqlite3` and starting the backend again.
+Local development note: migrations are deferred while the model surface is still changing. If you have a database created before P4, recreate it by removing `backend/data/b-impact.sqlite3` and starting the backend again.
 
 Start the API:
 
@@ -154,7 +159,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyses \
   }'
 ```
 
-The accepted response returns `PENDING`. P3 then scans Python files, extracts symbols and supported edges, reads Git diff data, maps changed Python line ranges to symbols, records local parse failures or unmapped changes, and stores the analysis as `COMPLETED` unless orchestration or persistence fails.
+The accepted response returns `PENDING`. P4 then scans Python files, extracts symbols and supported edges, reads Git diff data, maps changed Python line ranges to symbols, generates baseline impacted symbol candidates, records local parse failures or unmapped changes, and stores the analysis as `COMPLETED` unless orchestration or persistence fails.
 
 Supported diff modes:
 
@@ -176,12 +181,15 @@ Read the Markdown report:
 curl http://127.0.0.1:8000/api/v1/analyses/replace-with-analysis-uuid/report
 ```
 
-The analysis result includes diff and mapping summary fields:
+The analysis result includes diff, mapping, and propagation summary fields:
 
 - `changed_files`
 - `changed_python_files`
 - `changed_symbols`
 - `unmapped_changes`
+- `impacted_symbols`
+- `impacted_tests`
+- `propagation_paths`
 
 The analysis result also includes extraction summary fields:
 
@@ -191,7 +199,19 @@ The analysis result also includes extraction summary fields:
 - `extracted_symbols`
 - `extracted_edges`
 
-Impact-oriented fields remain zero in P3 because impact propagation, scoring, coverage, and test recommendation are not implemented.
+Propagation rules in P4:
+
+- `imports`: propagate in reverse from imported module to importer module
+- `inherits`: propagate in reverse from base class to subclass
+- `contains`: propagate both parent -> child and child -> parent as a structural cascade
+- `max_depth`: limits breadth-first traversal hop count
+
+P4 returns:
+
+- `changed_symbols`: changed symbol records from diff mapping
+- `impacted_symbols`: baseline candidate impacted symbols with source symbol, path, hop count, and traversed edge types
+
+The scored `impacts` list remains empty in P4 because final scoring, confidence, coverage, and test recommendation are not implemented.
 
 ## Development Notes
 
@@ -199,6 +219,7 @@ Impact-oriented fields remain zero in P3 because impact propagation, scoring, co
 - Keep P1 persistence and status behavior aligned with `docs/ADR/0002-p1-persistence-and-analysis-status.md`.
 - Keep P2 parser behavior aligned with `docs/ADR/0003-p2-python-ast-symbol-extraction.md`.
 - Keep P3 diff mapping behavior aligned with `docs/ADR/0004-p3-git-diff-and-changed-symbol-mapping.md`.
-- Do not add impact propagation, scoring, coverage, or test recommendation logic in P3.
+- Keep P4 baseline propagation behavior aligned with `docs/ADR/0005-p4-baseline-impact-propagation.md`.
+- Do not add final scoring, confidence output, coverage, or test recommendation logic in P4.
 - Do not add multi-language support.
 - Backend errors use the ADR error envelope with `error.code`, `error.message`, `error.details`, and `error.request_id`.

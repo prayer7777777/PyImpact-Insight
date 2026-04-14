@@ -18,4 +18,3 @@ async def request(
         trust_env=False,
     ) as client:
         return await client.request(method, path, json=json)
-
