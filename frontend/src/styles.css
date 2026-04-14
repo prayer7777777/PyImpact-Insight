@@ -1,0 +1,140 @@
+:root {
+  color: #17211b;
+  background: #f7f8f4;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.intro-band,
+.status-band,
+.endpoint-band {
+  padding: 48px clamp(20px, 6vw, 72px);
+}
+
+.intro-band {
+  background: #dfeee6;
+  border-bottom: 1px solid #b7d1c3;
+}
+
+.status-band {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  background: #f7f8f4;
+  border-bottom: 1px solid #d8ddd2;
+}
+
+.endpoint-band {
+  background: #ffffff;
+}
+
+.eyebrow {
+  margin: 0 0 10px;
+  color: #35634b;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+h1,
+h2 {
+  margin: 0;
+  line-height: 1.15;
+  letter-spacing: 0;
+}
+
+h1 {
+  max-width: 760px;
+  font-size: clamp(2rem, 4vw, 4.2rem);
+}
+
+h2 {
+  font-size: clamp(1.35rem, 2vw, 2rem);
+}
+
+.intro-copy {
+  max-width: 720px;
+  margin: 20px 0 0;
+  color: #3e4a42;
+  font-size: 1.08rem;
+  line-height: 1.7;
+}
+
+.status-pill {
+  display: inline-flex;
+  min-width: 120px;
+  justify-content: center;
+  border-radius: 8px;
+  padding: 10px 16px;
+  border: 1px solid #9ab7a8;
+  background: #eef6f1;
+  color: #1f5138;
+  font-weight: 700;
+}
+
+.status-unavailable {
+  border-color: #c9b363;
+  background: #fbf4ce;
+  color: #5f4d00;
+}
+
+.status-checking {
+  border-color: #c8cfc4;
+  background: #f4f5f2;
+  color: #485149;
+}
+
+ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin: 24px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+li {
+  border: 1px solid #d9dfd5;
+  border-radius: 8px;
+  padding: 14px 16px;
+  background: #fafbf8;
+}
+
+code {
+  overflow-wrap: anywhere;
+  color: #194d35;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+@media (max-width: 640px) {
+  .status-band {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
