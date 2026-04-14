@@ -1,6 +1,6 @@
 # B-Impact
 
-B-Impact is the V1 implementation for a Python repository change-impact analyzer. P5 provides repository registration, SQLite persistence, analysis task lifecycle storage, Python file scanning, AST-based symbol extraction, Git diff reading, changed symbol mapping, baseline impact propagation, and deterministic final impact scoring over imports, inheritance, and containment edges without implementing call graph propagation, coverage, test recommendation ranking, or historical snapshot graphs.
+B-Impact is the V1 implementation for a Python repository change-impact analyzer. P5.5 provides repository registration, SQLite persistence, analysis task lifecycle storage, Python file scanning, AST-based symbol extraction, Git diff reading, changed symbol mapping, baseline impact propagation, deterministic final impact scoring, and a frontend workbench that can create repositories, run analyses, and display real summary, impact, and report data without implementing call graph propagation, coverage, test recommendation ranking, or historical snapshot graphs.
 
 The implementation follows:
 
@@ -15,7 +15,7 @@ The implementation follows:
 
 ## Current Scope
 
-P5 includes:
+P5.5 includes:
 
 - FastAPI backend under `backend/`
 - Pydantic schemas aligned with ADR 0001 through ADR 0006
@@ -40,10 +40,11 @@ P5 includes:
 - Multi-path merge into one final ranked result per target symbol
 - Versioned API routes under `/api/v1`
 - React + Vite frontend under `frontend/`
+- Frontend workbench with repository creation, analysis creation, local recent-item history, analysis summary display, final impact list, and Markdown report viewer
 - Health endpoint, repository registration, analysis creation, analysis detail, and Markdown report routes
 - Backend tests for health, repository validation, analysis creation/querying, report output, symbol extraction, import edges, local parse failures, Git diff modes, changed symbol mapping, propagation over imports/inherits/contains, cycle handling, hop limits, impacted test detection, scoring weights, hop decay, multi-path merge, and added/deleted file behavior
 
-P5 does not include:
+P5.5 does not include:
 
 - call graph extraction
 - coverage-backed test recommendation
@@ -88,7 +89,7 @@ cd backend
 python3 -c "from app.db.session import init_db; init_db()"
 ```
 
-Local development note: migrations are deferred while the model surface is still changing. If you have a database created before P5, recreate it by removing `backend/data/b-impact.sqlite3` and starting the backend again.
+Local development note: migrations are deferred while the model surface is still changing. If you have a database created before P5.5, recreate it by removing `backend/data/b-impact.sqlite3` and starting the backend again.
 
 Start the API:
 
@@ -134,6 +135,20 @@ http://127.0.0.1:5173
 
 The Vite dev server proxies `/api` requests to `http://127.0.0.1:8000`.
 
+Current frontend capability:
+
+- create a repository from a local path
+- run a real analysis against the current P5 backend
+- reload a prior analysis by ID
+- keep recent repositories and analyses in browser-local storage
+- display summary metrics, ranked impacts, warnings, and the Markdown report
+
+Current frontend limits:
+
+- recent repository and analysis history is browser-local, not server-side list data
+- there is no graph view, test suggestion panel, or coverage visualization yet
+- there is no multi-page route structure yet; P5.5 is a focused single-page workbench
+
 ## API Flow
 
 Create a repository record:
@@ -163,7 +178,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyses \
   }'
 ```
 
-The accepted response returns `PENDING`. P5 then scans Python files, extracts symbols and supported edges, reads Git diff data, maps changed Python line ranges to symbols, generates baseline impacted symbol candidates, scores final impacts, records local parse failures or unmapped changes, and stores the analysis as `COMPLETED` unless orchestration or persistence fails.
+The accepted response returns `PENDING`. P5 then scans Python files, extracts symbols and supported edges, reads Git diff data, maps changed Python line ranges to symbols, generates baseline impacted symbol candidates, scores final impacts, records local parse failures or unmapped changes, and stores the analysis as `COMPLETED` unless orchestration or persistence fails. P5.5 renders those persisted results directly in the frontend workbench.
 
 Supported diff modes:
 
@@ -221,7 +236,7 @@ Propagation and scoring rules in P5:
 - confidence thresholds: `high >= 0.75`, `medium >= 0.45`, otherwise `low`
 - multiple paths merge into one final impact; public score keeps the best path score, then applies the optional test-symbol bonus
 
-P5 returns:
+P5 and P5.5 return:
 
 - `changed_symbols`: changed symbol records from diff mapping
 - `impacted_symbols`: baseline candidate impacted symbols with source symbol, path, hop count, and traversed edge types
@@ -235,5 +250,5 @@ P5 returns:
 - Keep P3 diff mapping behavior aligned with `docs/ADR/0004-p3-git-diff-and-changed-symbol-mapping.md`.
 - Keep P4 baseline propagation behavior aligned with `docs/ADR/0005-p4-baseline-impact-propagation.md`.
 - Keep P5 final scoring behavior aligned with `docs/ADR/0006-p5-impact-scoring-and-finalization.md`.
-- Do not add call graph propagation, coverage-backed scoring, test recommendation generation, or multi-language support in P5.
+- Do not add call graph propagation, coverage-backed scoring, test recommendation generation, or multi-language support in P5.5.
 - Backend errors use the ADR error envelope with `error.code`, `error.message`, `error.details`, and `error.request_id`.
